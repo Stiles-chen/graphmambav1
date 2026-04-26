@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 torch.manual_seed(0)
+import copy
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_geometric.nn as pygnn
@@ -119,7 +120,8 @@ class GPSLayer(nn.Module):
                  local_gnn_type, global_model_type, num_heads,
                  pna_degrees=None, equivstable_pe=False, dropout=0.0,
                  attn_dropout=0.0, layer_norm=False, batch_norm=True,
-                 bigbird_cfg=None):
+                 bigbird_cfg=None, enable_reverse_mamba=False,
+                 fusion_mode='fixed', fixed_weight=0.5):
         super().__init__()
 
         self.dim_h = dim_h
@@ -129,6 +131,13 @@ class GPSLayer(nn.Module):
         self.batch_norm = batch_norm
         self.equivstable_pe = equivstable_pe
         self.NUM_BUCKETS = 3
+        self.enable_reverse_mamba = enable_reverse_mamba
+        self.fusion_mode = fusion_mode
+        self.fixed_weight = fixed_weight
+        self.gate_layer = None
+        self.self_attn_reverse = None
+        if self.enable_reverse_mamba and self.fusion_mode == 'gated':
+            self.gate_layer = nn.Linear(dim_h * 2, dim_h)
 
         # Local message-passing model.
         if local_gnn_type == 'None':
@@ -235,6 +244,9 @@ class GPSLayer(nn.Module):
             raise ValueError(f"Unsupported global x-former model: "
                              f"{global_model_type}")
         self.global_model_type = global_model_type
+        if self.enable_reverse_mamba and 'Mamba' in global_model_type \
+                and not isinstance(self.self_attn, list):
+            self.self_attn_reverse = copy.deepcopy(self.self_attn)
 
         if self.layer_norm and self.batch_norm:
             raise ValueError("Cannot apply two types of normalization together")
@@ -396,7 +408,8 @@ class GPSLayer(nn.Module):
                     h_ind_perm = lexsort([deg+deg_noise, batch.batch])
                     h_dense, mask = to_dense_batch(h[h_ind_perm], batch.batch[h_ind_perm])
                     h_ind_perm_reverse = torch.argsort(h_ind_perm)
-                    h_attn = self.self_attn(h_dense)[mask][h_ind_perm_reverse]
+                    h_attn = self._apply_mamba_scan_with_permutation(
+                        h, batch.batch, h_ind_perm, h_dense, mask, h_ind_perm_reverse, batch)
                 else:
                     mamba_arr = []
                     deg = degree(batch.edge_index[0], batch.x.shape[0]).to(torch.float)
@@ -407,7 +420,8 @@ class GPSLayer(nn.Module):
                         h_ind_perm = lexsort([deg+deg_noise, batch.batch])
                         h_dense, mask = to_dense_batch(h[h_ind_perm], batch.batch[h_ind_perm])
                         h_ind_perm_reverse = torch.argsort(h_ind_perm)
-                        h_attn = self.self_attn(h_dense)[mask][h_ind_perm_reverse]
+                        h_attn = self._apply_mamba_scan_with_permutation(
+                            h, batch.batch, h_ind_perm, h_dense, mask, h_ind_perm_reverse, batch)
                         mamba_arr.append(h_attn)
                     h_attn = sum(mamba_arr) / 5
                         
@@ -425,7 +439,7 @@ class GPSLayer(nn.Module):
                         h_ind_perm_sort = lexsort([deg[ind_i], batch.batch[ind_i]])
                         h_ind_perm_i = ind_i[h_ind_perm_sort]
                         h_dense, mask = to_dense_batch(h[h_ind_perm_i], batch.batch[h_ind_perm_i])
-                        h_dense = self.self_attn(h_dense)[mask]
+                        h_dense = self._apply_mamba_bucket_scan(h_dense, mask, batch)
                         indices_arr.append(h_ind_perm_i)
                         emb_arr.append(h_dense)
                     h_ind_perm_reverse = torch.argsort(torch.cat(indices_arr))
@@ -445,7 +459,7 @@ class GPSLayer(nn.Module):
                             h_ind_perm_sort = lexsort([deg[ind_i], batch.batch[ind_i]])
                             h_ind_perm_i = ind_i[h_ind_perm_sort]
                             h_dense, mask = to_dense_batch(h[h_ind_perm_i], batch.batch[h_ind_perm_i])
-                            h_dense = self.self_attn(h_dense)[mask]
+                            h_dense = self._apply_mamba_bucket_scan(h_dense, mask, batch)
                             indices_arr.append(h_ind_perm_i)
                             emb_arr.append(h_dense)
                         h_ind_perm_reverse = torch.argsort(torch.cat(indices_arr))
@@ -751,6 +765,43 @@ class GPSLayer(nn.Module):
                            key_padding_mask=key_padding_mask,
                            need_weights=False)[0]
         return x
+
+    def _fuse_mamba_outputs(self, h_fwd, h_rev, batch):
+        """Fuse forward and reverse Mamba outputs."""
+        if self.fusion_mode == 'fixed':
+            h_attn = self.fixed_weight * h_fwd + (1 - self.fixed_weight) * h_rev
+        elif self.fusion_mode == 'gated':
+            # Concatenate and apply gate
+            combined = torch.cat([h_fwd, h_rev], dim=-1)
+            gate = torch.sigmoid(self.gate_layer(combined))
+            h_attn = gate * h_fwd + (1 - gate) * h_rev
+        else:
+            raise ValueError(f"Unsupported fusion_mode: {self.fusion_mode}")
+        return h_attn
+
+    def _apply_mamba_bucket_scan(self, h_dense, mask, batch):
+        h_fwd = self.self_attn(h_dense)
+        if not self.enable_reverse_mamba:
+            return h_fwd[mask]
+        h_rev = torch.flip(h_dense, dims=[1])
+        if self.self_attn_reverse is None:
+            raise ValueError("Independent reverse Mamba is required for Mamba_Hybrid_Degree_Noise_Bucket.")
+        h_rev = self.self_attn_reverse(h_rev)
+        h_rev = torch.flip(h_rev, dims=[1])
+        h_attn = self._fuse_mamba_outputs(h_fwd, h_rev, batch)
+        return h_attn[mask]
+
+    def _apply_mamba_scan_with_permutation(
+            self, h, batch_index, h_ind_perm, h_dense, mask, h_ind_perm_reverse, batch):
+        h_fwd = self.self_attn(h_dense)[mask][h_ind_perm_reverse]
+        if not self.enable_reverse_mamba:
+            return h_fwd
+        h_ind_perm_rev = torch.flip(h_ind_perm, dims=[0])
+        h_dense_rev, mask_rev = to_dense_batch(h[h_ind_perm_rev], batch_index[h_ind_perm_rev])
+        h_ind_perm_rev_reverse = torch.argsort(h_ind_perm_rev)
+        reverse_mamba = self.self_attn_reverse if self.self_attn_reverse is not None else self.self_attn
+        h_rev = reverse_mamba(h_dense_rev)[mask_rev][h_ind_perm_rev_reverse]
+        return self._fuse_mamba_outputs(h_fwd, h_rev, batch)
 
     def _ff_block(self, x):
         """Feed Forward block.
