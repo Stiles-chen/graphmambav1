@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 
 import numpy as np
@@ -14,11 +15,12 @@ from torch_geometric.graphgym.utils.epoch import is_eval_epoch, is_ckpt_epoch
 from graphgps.loss.subtoken_prediction_loss import subtoken_cross_entropy
 from graphgps.utils import cfg_to_dict, flatten_dict, make_wandb_name
 
-from deepspeed.profiling.flops_profiler import FlopsProfiler
-#from torch.autograd import profiler
+# from deepspeed.profiling.flops_profiler import FlopsProfiler
+# from torch.autograd import profiler
 from torch.profiler import profile, record_function, ProfilerActivity
 
-def subsample_batch_index(batch, min_k = 1, ratio = 0.1):
+
+def subsample_batch_index(batch, min_k=1, ratio=0.1):
     torch.manual_seed(0)
     unique_batches = torch.unique(batch.batch)
     # Initialize list to store permuted indices
@@ -28,7 +30,7 @@ def subsample_batch_index(batch, min_k = 1, ratio = 0.1):
         indices_in_batch = (batch.batch == batch_index).nonzero().squeeze()
         # See how many nodes in the graphs
         # And how many left after subsetting
-        k = int(indices_in_batch.size(0)*ratio)
+        k = int(indices_in_batch.size(0) * ratio)
         # If subsetting gives more than 1, do subsetting
         if k > min_k:
             perm = torch.randperm(indices_in_batch.size(0))
@@ -47,10 +49,76 @@ def arxiv_cross_entropy(pred, true, split_idx):
     true = true.squeeze(-1)
     if pred.ndim > 1 and true.ndim == 1:
         pred_score = F.log_softmax(pred[split_idx], dim=-1)
-        loss =  F.nll_loss(pred_score, true[split_idx])
+        loss = F.nll_loss(pred_score, true[split_idx])
     else:
         raise ValueError("In ogbn cross_entropy calculation dimensions did not match.")
     return loss, pred_score
+
+
+def _detach_to_cpu(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {k: _detach_to_cpu(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_detach_to_cpu(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_to_cpu(v) for v in value)
+    return value
+
+
+def _merge_prediction_batches(batches):
+    if not batches:
+        return []
+
+    first = batches[0]
+    if torch.is_tensor(first):
+        return torch.cat(batches, dim=0)
+    if isinstance(first, np.ndarray):
+        return np.concatenate(batches, axis=0)
+    if isinstance(first, dict):
+        return {
+            key: _merge_prediction_batches([batch[key] for batch in batches])
+            for key in first
+        }
+    if isinstance(first, list):
+        merged = []
+        for batch in batches:
+            merged.extend(batch)
+        return merged
+    if isinstance(first, tuple):
+        merged = []
+        for batch in batches:
+            merged.extend(list(batch))
+        return merged
+    return batches
+
+
+def _forward_eval_batch(loader, model, batch, split):
+    batch.split = split
+    batch.to(torch.device(cfg.device))
+    if cfg.gnn.head == 'inductive_edge':
+        pred, true, extra_stats = model(batch)
+    else:
+        pred, true = model(batch)
+        extra_stats = {}
+
+    if cfg.dataset.name == 'ogbg-code2':
+        loss, pred_score = subtoken_cross_entropy(pred, true)
+        _true = true
+        _pred = pred_score
+    elif cfg.dataset.name == 'ogbn-arxiv':
+        index_split = loader.dataset.split_idx[split].to(torch.device(cfg.device))
+        loss, pred_score = arxiv_cross_entropy(pred, true, index_split)
+        _true = true[index_split].detach().to('cpu', non_blocking=True)
+        _pred = pred_score.detach().to('cpu', non_blocking=True)
+    else:
+        loss, pred_score = compute_loss(pred, true)
+        _true = true.detach().to('cpu', non_blocking=True)
+        _pred = pred_score.detach().to('cpu', non_blocking=True)
+
+    return loss, _true, _pred, extra_stats
+
 
 # @profiler.profile
 # def profile_mem_forward(model, batch):
@@ -63,8 +131,9 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
     if_flop = False
     if_select = False
     if if_flop:
+        from deepspeed.profiling.flops_profiler import FlopsProfiler
         prof = FlopsProfiler(model, None)
-        #profile_step = 0
+        # profile_step = 0
         total_flop_s = 0.
         sample_count = 0
         if if_select:
@@ -76,14 +145,14 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
     for iter, batch in enumerate(loader):
         if if_select:
             ratio = 1.0
-            idx = subsample_batch_index(batch, min_k = 1, ratio = ratio)
+            idx = subsample_batch_index(batch, min_k=1, ratio=ratio)
             batch = batch.subgraph(idx)
         # flop related
-        if if_flop: # and iter == profile_step:
+        if if_flop:  # and iter == profile_step:
             prof.start_profile()
         batch.split = 'train'
         batch.to(torch.device(cfg.device))
-        
+
         pred, true = model(batch)
         if cfg.dataset.name == 'ogbg-code2':
             loss, pred_score = subtoken_cross_entropy(pred, true)
@@ -102,9 +171,9 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
         if if_flop:
             prof.stop_profile()
             flops = prof.get_total_flops()
-            flops_s = flops/1000000000.
-            total_flop_s+=flops_s
-            sample_count+=len(torch.unique(batch.batch))
+            flops_s = flops / 1000000000.
+            total_flop_s += flops_s
+            sample_count += len(torch.unique(batch.batch))
             params = prof.get_total_params()
             prof.end_profile()
             if if_select:
@@ -127,18 +196,17 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
         time_start = time.time()
     if if_flop:
         print('################ Print flop')
-        print(total_flop_s/sample_count, params)
+        print(total_flop_s / sample_count, params)
         print('################ End print flop')
     if if_mem:
         print('################ Print mem')
         print(torch.cuda.max_memory_allocated() / (1024 ** 2))
         print(torch.cuda.max_memory_reserved() / (1024 ** 2))
-        #print(prof_mem.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=10))
+        # print(prof_mem.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=10))
         print('################ End print mem')
     if if_select:
         print('################ Print avg nodes')
-        print(total_node/sample_count)
-
+        print(total_node / sample_count)
 
 
 @torch.no_grad()
@@ -146,26 +214,9 @@ def eval_epoch(logger, loader, model, split='val'):
     model.eval()
     time_start = time.time()
     for batch in loader:
-        batch.split = split
-        batch.to(torch.device(cfg.device))
-        if cfg.gnn.head == 'inductive_edge':
-            pred, true, extra_stats = model(batch)
-        else:
-            pred, true = model(batch)
-            extra_stats = {}
-        if cfg.dataset.name == 'ogbg-code2':
-            loss, pred_score = subtoken_cross_entropy(pred, true)
-            _true = true
-            _pred = pred_score
-        elif cfg.dataset.name == 'ogbn-arxiv':
-            index_split = loader.dataset.split_idx[split].to(torch.device(cfg.device))
-            loss, pred_score = arxiv_cross_entropy(pred, true, index_split)
-            _true = true[index_split].detach().to('cpu', non_blocking=True)
-            _pred = pred_score.detach().to('cpu', non_blocking=True)
-        else:
-            loss, pred_score = compute_loss(pred, true)
-            _true = true.detach().to('cpu', non_blocking=True)
-            _pred = pred_score.detach().to('cpu', non_blocking=True)
+        loss, _true, _pred, extra_stats = _forward_eval_batch(
+            loader, model, batch, split
+        )
         logger.update_stats(true=_true,
                             pred=_pred,
                             loss=loss.detach().cpu().item(),
@@ -174,6 +225,43 @@ def eval_epoch(logger, loader, model, split='val'):
                             dataset_name=cfg.dataset.name,
                             **extra_stats)
         time_start = time.time()
+
+
+@torch.no_grad()
+def collect_split_predictions(loader, model, split='val'):
+    model.eval()
+    pred_batches = []
+    true_batches = []
+
+    for batch in loader:
+        _, true_cpu, pred_cpu, _ = _forward_eval_batch(loader, model, batch, split)
+        pred_batches.append(_detach_to_cpu(pred_cpu))
+        true_batches.append(_detach_to_cpu(true_cpu))
+
+    return {
+        'predictions': _merge_prediction_batches(pred_batches),
+        'targets': _merge_prediction_batches(true_batches),
+    }
+
+
+def save_prediction_artifact(loaders, model, cur_epoch, best_epoch, metric_name=None, metric_value=None):
+    artifact = {
+        'dataset': cfg.dataset.name,
+        'run_id': cfg.run_id,
+        'epoch': cur_epoch,
+        'best_epoch': best_epoch,
+    }
+    if metric_name is not None:
+        artifact['metric_name'] = metric_name
+    if metric_value is not None:
+        artifact['metric_value'] = metric_value
+
+    artifact['val'] = collect_split_predictions(loaders[1], model, split='val')
+    artifact['test'] = collect_split_predictions(loaders[2], model, split='test')
+
+    output_path = os.path.join(cfg.run_dir, 'predictions.pt')
+    torch.save(artifact, output_path)
+    logging.info("Saved predictions to %s", output_path)
 
 
 @register_train('custom')
@@ -280,6 +368,15 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
             if cfg.train.enable_ckpt and cfg.train.ckpt_best and \
                     best_epoch == cur_epoch:
                 save_ckpt(model, optimizer, scheduler, cur_epoch)
+                if getattr(cfg.train, 'save_predictions', True):
+                    metric_name = None if cfg.metric_best == 'auto' else cfg.metric_best
+                    metric_value = None
+                    if metric_name is not None and metric_name in perf[1][best_epoch]:
+                        metric_value = perf[1][best_epoch][metric_name]
+                    save_prediction_artifact(
+                        loaders, model, cur_epoch, best_epoch,
+                        metric_name=metric_name, metric_value=metric_value
+                    )
                 if cfg.train.ckpt_clean:  # Delete old ckpt each time.
                     clean_ckpt()
             logging.info(
