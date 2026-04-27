@@ -72,11 +72,11 @@ def parse_args():
 def load_labels(dataset, idx=1):
     """根据数据集加载标签"""
     if 'COCOSuperpixels' in dataset:
-        with open('datasets/COCOSuperpixels/slic_compactness_30/edge_wt_region_boundary/raw/val.pickle') as f:
+        with open('datasets/COCOSuperpixels/slic_compactness_30/edge_wt_region_boundary/raw/val.pickle', 'rb') as f:
             data_info = pickle.load(f)
             labels = data_info[0][-1]
     elif 'VOCSuperpixels' in dataset:
-        with open('datasets/VOCSuperpixels/slic_compactness_30/edge_wt_region_boundary/raw/val.pickle') as f:
+        with open('datasets/VOCSuperpixels/slic_compactness_30/edge_wt_region_boundary/raw/val.pickle', 'rb') as f:
             data_info = pickle.load(f)
             labels = data_info[0][-1]
     elif 'MalNetTiny' in dataset:
@@ -126,16 +126,6 @@ def load_labels(dataset, idx=1):
     else:
         raise NotImplementedError("Unsupported dataset!")
     return labels
-
-
-def load_predictions(dir_path, filename='best.ckpt'):
-    """加载预测分数"""
-    ckpt_path = os.path.join(dir_path, filename)
-    ckpt = torch.load(ckpt_path)  # 使用 torch.load 加载
-    # 假设 ckpt 是一个字典，包含预测数据
-    # 如果预测数据存储在特定键下（如 'predictions'），请调整
-    return list(ckpt.items())  # 如果 ckpt 是字典
-    # 或者直接返回 ckpt，如果它已经是列表或其他格式
 
 
 def _is_numeric_scalar(value):
@@ -234,7 +224,7 @@ def _extract_predictions(obj, source):
     raise ValueError(f"Unsupported checkpoint structure in {source}: {type(obj)}")
 
 
-def _candidate_prediction_paths(dir_path, filename='best.ckpt'):
+def _candidate_prediction_paths(dir_path, filename='predictions.pt'):
     candidates = []
     if os.path.isfile(dir_path):
         candidates.append(dir_path)
@@ -242,7 +232,7 @@ def _candidate_prediction_paths(dir_path, filename='best.ckpt'):
         normalized_dir = os.path.normpath(dir_path)
         base_name = os.path.basename(normalized_dir)
 
-        if base_name == 'ckpt':
+        if base_name == 'pt':
             run_dir = os.path.dirname(normalized_dir)
             for name in PREDICTION_FILENAMES:
                 candidates.append(os.path.join(run_dir, name))
@@ -261,20 +251,20 @@ def _candidate_prediction_paths(dir_path, filename='best.ckpt'):
     return ordered
 
 
-def load_predictions(dir_path, filename='best.ckpt'):
+def load_predictions(dir_path, filename='predictions.pt'):
     """Load sample-level predictions from a checkpoint-like file."""
     errors = []
-    for ckpt_path in _candidate_prediction_paths(dir_path, filename):
-        if not os.path.exists(ckpt_path):
+    for pt_path in _candidate_prediction_paths(dir_path, filename):
+        if not os.path.exists(pt_path):
             continue
         try:
-            ckpt = _load_torch_object(ckpt_path)
-            predictions = _extract_predictions(ckpt, ckpt_path)
+            pt = _load_torch_object(pt_path)
+            predictions = _extract_predictions(pt, pt_path)
             if len(predictions) == 0:
-                raise ValueError(f"No predictions found in {ckpt_path}")
+                raise ValueError(f"No predictions found in {pt_path}")
             return predictions
         except Exception as exc:
-            errors.append(f"{ckpt_path}: {exc}")
+            errors.append(f"{pt_path}: {exc}")
 
     if not errors:
         raise FileNotFoundError(
@@ -328,13 +318,13 @@ def main():
     if 'COCOSuperpixels' in args.dataset:
         nodedir = f'results/cocosuperpixels-EX-bi/0'
         edgedir = f'results/cocosuperpixels-EX-bi-edge/0'
- 
+
         r1 = load_predictions(nodedir)
         r2 = load_predictions(edgedir)
-        
+
     elif 'VOCSuperpixels' in args.dataset:
-        nodedir = f'results/vocsuperpixels-EX-bi/0'
-        edgedir = f'results/vocsuperpixels-EX-bi-edge/0'
+        nodedir = f'results/voc_mhdn/0'
+        edgedir = f'results/voc_mhdnb/0'
 
         r1 = load_predictions(nodedir)
         r2 = load_predictions(edgedir)
