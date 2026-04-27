@@ -376,45 +376,24 @@ def main():
     labels = load_labels(args.dataset, idx=args.idx)
 
     # Load predictions
-    if 'COCOSuperpixels' in args.dataset:
-        nodedir = f'results/cocosuperpixels-EX-bi/0'
-        edgedir = f'results/cocosuperpixels-EX-bi-edge/0'
+    dataset_defaults = {
+        'COCOSuperpixels': ('results/cocosuperpixels-EX-bi/0', 'results/cocosuperpixels-EX-bi-edge/0'),
+        'VOCSuperpixels': ('results/voc_mhdn/0', 'results/voc_mhdnb/0'),
+        'MalNetTiny': ('results/malnettiny-EX-bi/0', 'results/malnettiny-EX-bi-edge/0'),
+        'peptides-functional': ('results/peptides-func-EX-bi/0', 'results/peptides-func-EX-bi-edge/0'),
+        'peptides-structural': ('results/peptides-struct-EX-bi/0', 'results/peptides-struct-EX-bi-edge/0'),
+    }
 
-        r1, t1 = load_predictions_and_targets(nodedir)
-        r2, t2 = load_predictions_and_targets(edgedir)
+    default_node_dir, default_edge_dir = None, None
+    for dataset_key, default_dirs in dataset_defaults.items():
+        if dataset_key in args.dataset:
+            default_node_dir, default_edge_dir = default_dirs
+            break
 
-    elif 'VOCSuperpixels' in args.dataset:
-        nodedir = f'results/voc_mhdn/0'
-        edgedir = f'results/voc_mhdnb/0'
-
-        r1, t1 = load_predictions_and_targets(nodedir)
-        r2, t2 = load_predictions_and_targets(edgedir)
-
-    elif "MalNetTiny" in args.dataset:
-        nodedir = f'results/malnettiny-EX-bi/0'
-        edgedir = f'results/malnettiny-EX-bi-edge/0'
-
-        r1, t1 = load_predictions_and_targets(nodedir)
-        r2, t2 = load_predictions_and_targets(edgedir)
-
-    elif "peptides-functional" in args.dataset:
-        nodedir = f'results/peptides-func-EX-bi/0'
-        edgedir = f'results/peptides-func-EX-bi-edge/0'
-
-        r1, t1 = load_predictions_and_targets(nodedir)
-        r2, t2 = load_predictions_and_targets(edgedir)
-
-    elif "peptides-structural" in args.dataset:
-        nodedir = f'results/peptides-struct-EX-bi/0'
-        edgedir = f'results/peptides-struct-EX-bi-edge/0'
-
-        r1, t1 = load_predictions_and_targets(nodedir)
-        r2, t2 = load_predictions_and_targets(edgedir)
-
-    else:
-        # Only load node and edge predictions
-        r1, t1 = load_predictions_and_targets(args.node_dir) if args.node_dir else (None, None)
-        r2, t2 = load_predictions_and_targets(args.edge_dir) if args.edge_dir else (None, None)
+    node_dir = args.node_dir or default_node_dir
+    edge_dir = args.edge_dir or default_edge_dir
+    r1, t1 = load_predictions_and_targets(node_dir) if node_dir else (None, None)
+    r2, t2 = load_predictions_and_targets(edge_dir) if edge_dir else (None, None)
 
     # Prefer sample-level targets saved together with predictions.
     # This avoids graph-level/node-level mismatch in datasets like VOC/COCO Superpixels.
