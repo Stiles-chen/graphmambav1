@@ -12,6 +12,10 @@ PREDICTION_KEYS = (
     'predictions', 'prediction', 'preds', 'pred', 'logits',
     'scores', 'y_pred', 'val_pred', 'test_pred'
 )
+TARGET_KEYS = (
+    'targets', 'target', 'labels', 'label', 'y_true',
+    'ground_truth', 'gt', 'val_targets', 'test_targets'
+)
 
 SPLIT_KEYS = ('val', 'valid', 'validation', 'test')
 
@@ -224,6 +228,37 @@ def _extract_predictions(obj, source):
     raise ValueError(f"Unsupported checkpoint structure in {source}: {type(obj)}")
 
 
+def _extract_targets(obj, source):
+    if isinstance(obj, dict):
+        for key in TARGET_KEYS:
+            if key in obj:
+                return _extract_targets(obj[key], f"{source}['{key}']")
+
+        for key in SPLIT_KEYS:
+            if key in obj:
+                nested = _extract_targets(obj[key], f"{source}['{key}']")
+                if nested is not None:
+                    return nested
+
+        return None
+
+    if isinstance(obj, (list, tuple)):
+        return [_normalize_prediction_item(item) for item in obj]
+
+    if torch.is_tensor(obj):
+        obj = obj.detach().cpu()
+        if obj.ndim == 0:
+            return [obj.item()]
+        return [_normalize_prediction_item(item) for item in obj]
+
+    if isinstance(obj, np.ndarray):
+        if obj.ndim == 0:
+            return [obj.item()]
+        return [_normalize_prediction_item(item) for item in obj]
+
+    return None
+
+
 def _candidate_prediction_paths(dir_path, filename='predictions.pt'):
     candidates = []
     if os.path.isfile(dir_path):
@@ -276,6 +311,32 @@ def load_predictions(dir_path, filename='predictions.pt'):
     )
 
 
+def load_predictions_and_targets(dir_path, filename='predictions.pt'):
+    """Load predictions and optional targets from prediction artifacts."""
+    errors = []
+    for pt_path in _candidate_prediction_paths(dir_path, filename):
+        if not os.path.exists(pt_path):
+            continue
+        try:
+            pt = _load_torch_object(pt_path)
+            predictions = _extract_predictions(pt, pt_path)
+            if len(predictions) == 0:
+                raise ValueError(f"No predictions found in {pt_path}")
+            targets = _extract_targets(pt, pt_path)
+            return predictions, targets
+        except Exception as exc:
+            errors.append(f"{pt_path}: {exc}")
+
+    if not errors:
+        raise FileNotFoundError(
+            f"No checkpoint or prediction file found under '{dir_path}'"
+        )
+
+    raise ValueError(
+        "Unable to load sample-level predictions/targets. Tried:\n" + "\n".join(errors)
+    )
+
+
 def compute_metric(labels, predictions, dataset):
     """根据数据集计算相应指标"""
     predictions = np.array(predictions)
@@ -319,41 +380,56 @@ def main():
         nodedir = f'results/cocosuperpixels-EX-bi/0'
         edgedir = f'results/cocosuperpixels-EX-bi-edge/0'
 
-        r1 = load_predictions(nodedir)
-        r2 = load_predictions(edgedir)
+        r1, t1 = load_predictions_and_targets(nodedir)
+        r2, t2 = load_predictions_and_targets(edgedir)
 
     elif 'VOCSuperpixels' in args.dataset:
         nodedir = f'results/voc_mhdn/0'
         edgedir = f'results/voc_mhdnb/0'
 
-        r1 = load_predictions(nodedir)
-        r2 = load_predictions(edgedir)
+        r1, t1 = load_predictions_and_targets(nodedir)
+        r2, t2 = load_predictions_and_targets(edgedir)
 
     elif "MalNetTiny" in args.dataset:
         nodedir = f'results/malnettiny-EX-bi/0'
         edgedir = f'results/malnettiny-EX-bi-edge/0'
 
-        r1 = load_predictions(nodedir)
-        r2 = load_predictions(edgedir)
+        r1, t1 = load_predictions_and_targets(nodedir)
+        r2, t2 = load_predictions_and_targets(edgedir)
 
     elif "peptides-functional" in args.dataset:
         nodedir = f'results/peptides-func-EX-bi/0'
         edgedir = f'results/peptides-func-EX-bi-edge/0'
 
-        r1 = load_predictions(nodedir)
-        r2 = load_predictions(edgedir)
+        r1, t1 = load_predictions_and_targets(nodedir)
+        r2, t2 = load_predictions_and_targets(edgedir)
 
     elif "peptides-structural" in args.dataset:
         nodedir = f'results/peptides-struct-EX-bi/0'
         edgedir = f'results/peptides-struct-EX-bi-edge/0'
 
-        r1 = load_predictions(nodedir)
-        r2 = load_predictions(edgedir)
+        r1, t1 = load_predictions_and_targets(nodedir)
+        r2, t2 = load_predictions_and_targets(edgedir)
 
     else:
         # Only load node and edge predictions
-        r1 = load_predictions(args.node_dir) if args.node_dir else None
-        r2 = load_predictions(args.edge_dir) if args.edge_dir else None
+        r1, t1 = load_predictions_and_targets(args.node_dir) if args.node_dir else (None, None)
+        r2, t2 = load_predictions_and_targets(args.edge_dir) if args.edge_dir else (None, None)
+
+    # Prefer sample-level targets saved together with predictions.
+    # This avoids graph-level/node-level mismatch in datasets like VOC/COCO Superpixels.
+    if t1 is not None and (r1 is None or len(t1) == len(r1)):
+        if len(labels) != len(t1):
+            print(
+                f"[Info] Replace labels loaded from dataset ({len(labels)}) "
+                f"with artifact targets ({len(t1)}) for sample-level alignment."
+            )
+            labels = np.array(t1)
+
+    if t2 is not None and r2 is not None and len(t2) != len(r2):
+        raise ValueError(
+            f"Edge predictions/targets length mismatch: pred={len(r2)} target={len(t2)}"
+        )
 
     # Fusion and evaluation: Coarse Search
     coarse_step = 0.2

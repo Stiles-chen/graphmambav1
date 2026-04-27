@@ -210,13 +210,18 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
 
 
 @torch.no_grad()
-def eval_epoch(logger, loader, model, split='val'):
+def eval_epoch(logger, loader, model, split='val', collect_predictions=False):
     model.eval()
     time_start = time.time()
+    pred_batches = [] if collect_predictions else None
+    true_batches = [] if collect_predictions else None
     for batch in loader:
         loss, _true, _pred, extra_stats = _forward_eval_batch(
             loader, model, batch, split
         )
+        if collect_predictions:
+            pred_batches.append(_detach_to_cpu(_pred))
+            true_batches.append(_detach_to_cpu(_true))
         logger.update_stats(true=_true,
                             pred=_pred,
                             loss=loss.detach().cpu().item(),
@@ -225,6 +230,12 @@ def eval_epoch(logger, loader, model, split='val'):
                             dataset_name=cfg.dataset.name,
                             **extra_stats)
         time_start = time.time()
+    if collect_predictions:
+        return {
+            'predictions': _merge_prediction_batches(pred_batches),
+            'targets': _merge_prediction_batches(true_batches),
+        }
+    return None
 
 
 @torch.no_grad()
@@ -244,7 +255,9 @@ def collect_split_predictions(loader, model, split='val'):
     }
 
 
-def save_prediction_artifact(loaders, model, cur_epoch, best_epoch, metric_name=None, metric_value=None):
+def save_prediction_artifact(loaders, model, cur_epoch, best_epoch,
+                             metric_name=None, metric_value=None,
+                             split_artifacts=None):
     artifact = {
         'dataset': cfg.dataset.name,
         'run_id': cfg.run_id,
@@ -256,8 +269,14 @@ def save_prediction_artifact(loaders, model, cur_epoch, best_epoch, metric_name=
     if metric_value is not None:
         artifact['metric_value'] = metric_value
 
-    artifact['val'] = collect_split_predictions(loaders[1], model, split='val')
-    artifact['test'] = collect_split_predictions(loaders[2], model, split='test')
+    if split_artifacts is not None:
+        if 'val' not in split_artifacts or 'test' not in split_artifacts:
+            raise ValueError("split_artifacts must contain both 'val' and 'test'")
+        artifact['val'] = split_artifacts['val']
+        artifact['test'] = split_artifacts['test']
+    else:
+        artifact['val'] = collect_split_predictions(loaders[1], model, split='val')
+        artifact['test'] = collect_split_predictions(loaders[2], model, split='test')
 
     output_path = os.path.join(cfg.run_dir, 'predictions.pt')
     torch.save(artifact, output_path)
@@ -309,10 +328,17 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
         train_epoch(loggers[0], loaders[0], model, optimizer, scheduler,
                     cfg.optim.batch_accumulation)
         perf[0].append(loggers[0].write_epoch(cur_epoch))
+        eval_split_artifacts = {}
         if is_eval_epoch(cur_epoch):
             for i in range(1, num_splits):
-                eval_epoch(loggers[i], loaders[i], model,
-                           split=split_names[i - 1])
+                split_name = split_names[i - 1]
+                split_artifact = eval_epoch(
+                    loggers[i], loaders[i], model,
+                    split=split_name,
+                    collect_predictions=getattr(cfg.train, 'save_predictions', True)
+                )
+                if split_artifact is not None:
+                    eval_split_artifacts[split_name] = split_artifact
                 perf[i].append(loggers[i].write_epoch(cur_epoch))
         else:
             for i in range(1, num_splits):
@@ -375,7 +401,8 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
                         metric_value = perf[1][best_epoch][metric_name]
                     save_prediction_artifact(
                         loaders, model, cur_epoch, best_epoch,
-                        metric_name=metric_name, metric_value=metric_value
+                        metric_name=metric_name, metric_value=metric_value,
+                        split_artifacts=eval_split_artifacts if eval_split_artifacts else None
                     )
                 if cfg.train.ckpt_clean:  # Delete old ckpt each time.
                     clean_ckpt()
