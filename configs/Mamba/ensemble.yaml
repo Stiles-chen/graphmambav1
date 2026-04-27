@@ -1,0 +1,3 @@
+dataset: VOCSuperpixels
+node_dir: results/voc_mhdn/0
+edge_dir: results/voc_mhdnb/0
