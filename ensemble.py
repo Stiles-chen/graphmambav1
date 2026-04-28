@@ -116,17 +116,19 @@ def load_labels(dataset, idx=1):
     elif 'peptides-structural' in dataset:
         csv_path = 'datasets/peptides-structural/raw/peptide_structure_normalized_dataset.csv.gz'
         split_path = 'datasets/peptides-structural/splits_random_stratified_peptide_structure.pickle'
+        target_names = [
+            'Inertia_mass_a', 'Inertia_mass_b', 'Inertia_mass_c',
+            'Inertia_valence_a', 'Inertia_valence_b', 'Inertia_valence_c',
+            'length_a', 'length_b', 'length_c', 'Spherocity',
+            'Plane_best_fit'
+        ]
         # 读取数据表
         df = pd.read_csv(csv_path)
         # 读取分割索引
         with open(split_path, 'rb') as f:
             splits = pickle.load(f)
         val_indices = splits['val']  # 整型索引
-        # 把字符串标签转为numpy数组
-        labels_raw = df.iloc[val_indices]['labels'].values  # 这里每个是string
-        # 转化为one-hot numpy数组
-        val_onehot = np.stack([np.array(eval(l)) for l in labels_raw])
-        labels = val_onehot
+        labels = df.iloc[val_indices][target_names].to_numpy(dtype=np.float32)
     else:
         raise NotImplementedError("Unsupported dataset!")
     return labels
@@ -395,13 +397,24 @@ def main():
     r1, t1 = load_predictions_and_targets(node_dir) if node_dir else (None, None)
     r2, t2 = load_predictions_and_targets(edge_dir) if edge_dir else (None, None)
 
+    def _output_dim(values):
+        arr = np.asarray(values)
+        return arr.shape[1] if arr.ndim > 1 else 1
+
     # Prefer sample-level targets saved together with predictions.
     # This avoids graph-level/node-level mismatch in datasets like VOC/COCO Superpixels.
     if t1 is not None and (r1 is None or len(t1) == len(r1)):
+        replace_reason = None
         if len(labels) != len(t1):
+            replace_reason = f"length mismatch ({len(labels)} vs {len(t1)})"
+        elif r1 is not None and _output_dim(labels) != _output_dim(r1) and _output_dim(t1) == _output_dim(r1):
+            replace_reason = (
+                f"output-dim mismatch ({_output_dim(labels)} vs {_output_dim(r1)})"
+            )
+        if replace_reason is not None:
             print(
-                f"[Info] Replace labels loaded from dataset ({len(labels)}) "
-                f"with artifact targets ({len(t1)}) for sample-level alignment."
+                f"[Info] Replace labels loaded from dataset with artifact targets "
+                f"for sample-level alignment due to {replace_reason}."
             )
             labels = np.array(t1)
 
