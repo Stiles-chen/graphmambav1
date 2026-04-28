@@ -401,22 +401,22 @@ def main():
         arr = np.asarray(values)
         return arr.shape[1] if arr.ndim > 1 else 1
 
-    # Prefer sample-level targets saved together with predictions.
-    # This avoids graph-level/node-level mismatch in datasets like VOC/COCO Superpixels.
+    # Prefer sample-level targets saved together with predictions whenever available.
+    # This avoids label-order/level mismatches (e.g., MalNetTiny val.txt ordering,
+    # VOC/COCO node-vs-graph supervision granularity).
     if t1 is not None and (r1 is None or len(t1) == len(r1)):
-        replace_reason = None
+        replace_reason = "prefer artifact targets"
         if len(labels) != len(t1):
             replace_reason = f"length mismatch ({len(labels)} vs {len(t1)})"
         elif r1 is not None and _output_dim(labels) != _output_dim(r1) and _output_dim(t1) == _output_dim(r1):
             replace_reason = (
                 f"output-dim mismatch ({_output_dim(labels)} vs {_output_dim(r1)})"
             )
-        if replace_reason is not None:
-            print(
-                f"[Info] Replace labels loaded from dataset with artifact targets "
-                f"for sample-level alignment due to {replace_reason}."
-            )
-            labels = np.array(t1)
+        print(
+            f"[Info] Replace labels loaded from dataset with artifact targets "
+            f"for sample-level alignment due to {replace_reason}."
+        )
+        labels = np.array(t1)
 
     if t2 is not None and r2 is not None and len(t2) != len(r2):
         raise ValueError(
