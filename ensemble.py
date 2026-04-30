@@ -12,6 +12,10 @@ PREDICTION_KEYS = (
     'predictions', 'prediction', 'preds', 'pred', 'logits',
     'scores', 'y_pred', 'val_pred', 'test_pred'
 )
+TARGET_KEYS = (
+    'targets', 'target', 'labels', 'label', 'y_true',
+    'ground_truth', 'gt', 'val_targets', 'test_targets'
+)
 
 SPLIT_KEYS = ('val', 'valid', 'validation', 'test')
 
@@ -112,17 +116,19 @@ def load_labels(dataset, idx=1):
     elif 'peptides-structural' in dataset:
         csv_path = 'datasets/peptides-structural/raw/peptide_structure_normalized_dataset.csv.gz'
         split_path = 'datasets/peptides-structural/splits_random_stratified_peptide_structure.pickle'
+        target_names = [
+            'Inertia_mass_a', 'Inertia_mass_b', 'Inertia_mass_c',
+            'Inertia_valence_a', 'Inertia_valence_b', 'Inertia_valence_c',
+            'length_a', 'length_b', 'length_c', 'Spherocity',
+            'Plane_best_fit'
+        ]
         # 读取数据表
         df = pd.read_csv(csv_path)
         # 读取分割索引
         with open(split_path, 'rb') as f:
             splits = pickle.load(f)
         val_indices = splits['val']  # 整型索引
-        # 把字符串标签转为numpy数组
-        labels_raw = df.iloc[val_indices]['labels'].values  # 这里每个是string
-        # 转化为one-hot numpy数组
-        val_onehot = np.stack([np.array(eval(l)) for l in labels_raw])
-        labels = val_onehot
+        labels = df.iloc[val_indices][target_names].to_numpy(dtype=np.float32)
     else:
         raise NotImplementedError("Unsupported dataset!")
     return labels
@@ -224,6 +230,37 @@ def _extract_predictions(obj, source):
     raise ValueError(f"Unsupported checkpoint structure in {source}: {type(obj)}")
 
 
+def _extract_targets(obj, source):
+    if isinstance(obj, dict):
+        for key in TARGET_KEYS:
+            if key in obj:
+                return _extract_targets(obj[key], f"{source}['{key}']")
+
+        for key in SPLIT_KEYS:
+            if key in obj:
+                nested = _extract_targets(obj[key], f"{source}['{key}']")
+                if nested is not None:
+                    return nested
+
+        return None
+
+    if isinstance(obj, (list, tuple)):
+        return [_normalize_prediction_item(item) for item in obj]
+
+    if torch.is_tensor(obj):
+        obj = obj.detach().cpu()
+        if obj.ndim == 0:
+            return [obj.item()]
+        return [_normalize_prediction_item(item) for item in obj]
+
+    if isinstance(obj, np.ndarray):
+        if obj.ndim == 0:
+            return [obj.item()]
+        return [_normalize_prediction_item(item) for item in obj]
+
+    return None
+
+
 def _candidate_prediction_paths(dir_path, filename='predictions.pt'):
     candidates = []
     if os.path.isfile(dir_path):
@@ -276,6 +313,32 @@ def load_predictions(dir_path, filename='predictions.pt'):
     )
 
 
+def load_predictions_and_targets(dir_path, filename='predictions.pt'):
+    """Load predictions and optional targets from prediction artifacts."""
+    errors = []
+    for pt_path in _candidate_prediction_paths(dir_path, filename):
+        if not os.path.exists(pt_path):
+            continue
+        try:
+            pt = _load_torch_object(pt_path)
+            predictions = _extract_predictions(pt, pt_path)
+            if len(predictions) == 0:
+                raise ValueError(f"No predictions found in {pt_path}")
+            targets = _extract_targets(pt, pt_path)
+            return predictions, targets
+        except Exception as exc:
+            errors.append(f"{pt_path}: {exc}")
+
+    if not errors:
+        raise FileNotFoundError(
+            f"No checkpoint or prediction file found under '{dir_path}'"
+        )
+
+    raise ValueError(
+        "Unable to load sample-level predictions/targets. Tried:\n" + "\n".join(errors)
+    )
+
+
 def compute_metric(labels, predictions, dataset):
     """根据数据集计算相应指标"""
     predictions = np.array(predictions)
@@ -315,45 +378,50 @@ def main():
     labels = load_labels(args.dataset, idx=args.idx)
 
     # Load predictions
-    if 'COCOSuperpixels' in args.dataset:
-        nodedir = f'results/cocosuperpixels-EX-bi/0'
-        edgedir = f'results/cocosuperpixels-EX-bi-edge/0'
+    dataset_defaults = {
+        'COCOSuperpixels': ('results/cocosuperpixels-EX-bi/0', 'results/cocosuperpixels-EX-bi-edge/0'),
+        'VOCSuperpixels': ('results/voc_mhdn/0', 'results/voc_mhdnb/0'),
+        'MalNetTiny': ('results/malnettiny-EX-bi/0', 'results/malnettiny-EX-bi-edge/0'),
+        'peptides-functional': ('results/peptides-func-EX-bi/0', 'results/peptides-func-EX-bi-edge/0'),
+        'peptides-structural': ('results/peptides-struct-EX-bi/0', 'results/peptides-struct-EX-bi-edge/0'),
+    }
 
-        r1 = load_predictions(nodedir)
-        r2 = load_predictions(edgedir)
+    default_node_dir, default_edge_dir = None, None
+    for dataset_key, default_dirs in dataset_defaults.items():
+        if dataset_key in args.dataset:
+            default_node_dir, default_edge_dir = default_dirs
+            break
 
-    elif 'VOCSuperpixels' in args.dataset:
-        nodedir = f'results/voc_mhdn/0'
-        edgedir = f'results/voc_mhdnb/0'
+    node_dir = args.node_dir or default_node_dir
+    edge_dir = args.edge_dir or default_edge_dir
+    r1, t1 = load_predictions_and_targets(node_dir) if node_dir else (None, None)
+    r2, t2 = load_predictions_and_targets(edge_dir) if edge_dir else (None, None)
 
-        r1 = load_predictions(nodedir)
-        r2 = load_predictions(edgedir)
+    def _output_dim(values):
+        arr = np.asarray(values)
+        return arr.shape[1] if arr.ndim > 1 else 1
 
-    elif "MalNetTiny" in args.dataset:
-        nodedir = f'results/malnettiny-EX-bi/0'
-        edgedir = f'results/malnettiny-EX-bi-edge/0'
+    # Prefer sample-level targets saved together with predictions whenever available.
+    # This avoids label-order/level mismatches (e.g., MalNetTiny val.txt ordering,
+    # VOC/COCO node-vs-graph supervision granularity).
+    if t1 is not None and (r1 is None or len(t1) == len(r1)):
+        replace_reason = "prefer artifact targets"
+        if len(labels) != len(t1):
+            replace_reason = f"length mismatch ({len(labels)} vs {len(t1)})"
+        elif r1 is not None and _output_dim(labels) != _output_dim(r1) and _output_dim(t1) == _output_dim(r1):
+            replace_reason = (
+                f"output-dim mismatch ({_output_dim(labels)} vs {_output_dim(r1)})"
+            )
+        print(
+            f"[Info] Replace labels loaded from dataset with artifact targets "
+            f"for sample-level alignment due to {replace_reason}."
+        )
+        labels = np.array(t1)
 
-        r1 = load_predictions(nodedir)
-        r2 = load_predictions(edgedir)
-
-    elif "peptides-functional" in args.dataset:
-        nodedir = f'results/peptides-func-EX-bi/0'
-        edgedir = f'results/peptides-func-EX-bi-edge/0'
-
-        r1 = load_predictions(nodedir)
-        r2 = load_predictions(edgedir)
-
-    elif "peptides-structural" in args.dataset:
-        nodedir = f'results/peptides-struct-EX-bi/0'
-        edgedir = f'results/peptides-struct-EX-bi-edge/0'
-
-        r1 = load_predictions(nodedir)
-        r2 = load_predictions(edgedir)
-
-    else:
-        # Only load node and edge predictions
-        r1 = load_predictions(args.node_dir) if args.node_dir else None
-        r2 = load_predictions(args.edge_dir) if args.edge_dir else None
+    if t2 is not None and r2 is not None and len(t2) != len(r2):
+        raise ValueError(
+            f"Edge predictions/targets length mismatch: pred={len(r2)} target={len(t2)}"
+        )
 
     # Fusion and evaluation: Coarse Search
     coarse_step = 0.2
