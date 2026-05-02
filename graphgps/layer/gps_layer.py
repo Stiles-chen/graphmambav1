@@ -7,7 +7,7 @@ import torch_geometric.nn as pygnn
 from performer_pytorch import SelfAttention
 from torch_geometric.data import Batch
 from torch_geometric.nn import Linear as Linear_pyg
-from torch_geometric.utils import to_dense_batch, scatter
+from torch_geometric.utils import to_dense_batch
 
 from graphgps.layer.gatedgcn_layer import GatedGCNLayer
 from graphgps.layer.gine_conv_layer import GINEConvESLapPE
@@ -111,6 +111,15 @@ def permute_within_batch(batch):
     permuted_indices = torch.cat(permuted_indices)
 
     return permuted_indices
+
+
+def scatter_mean_fallback(src, index, dim_size):
+    out = src.new_zeros((dim_size, src.size(-1)))
+    out.index_add_(0, index, src)
+    count = src.new_zeros(dim_size)
+    count.index_add_(0, index, torch.ones_like(index, dtype=src.dtype))
+    count = count.clamp_min(1.0).unsqueeze(-1)
+    return out / count
 
 class GPSLayer(nn.Module):
     """Local MPNN + full graph attention x-former layer.
@@ -862,8 +871,8 @@ class GPSLayer(nn.Module):
         batch.edge_attr = edge_out
 
         src, dst = batch.edge_index[0], batch.edge_index[1]
-        node_msg = scatter(edge_out, src, dim=0, dim_size=h.size(0), reduce='mean')
-        node_msg = node_msg + scatter(edge_out, dst, dim=0, dim_size=h.size(0), reduce='mean')
+        node_msg = scatter_mean_fallback(edge_out, src, dim_size=h.size(0))
+        node_msg = node_msg + scatter_mean_fallback(edge_out, dst, dim_size=h.size(0))
         return node_msg
 
     def _dfs_edge_order(self, edge_index, node_batch, num_nodes):
