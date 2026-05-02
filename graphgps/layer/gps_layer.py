@@ -134,6 +134,8 @@ class GPSLayer(nn.Module):
         self.self_attn_reverse = None
         self.fusion_mode = fusion_mode
         self.fixed_weight = fixed_weight
+        self.concat_proj = None
+        self.gate_layer = None
 
         # Local message-passing model.
         if local_gnn_type == 'None':
@@ -246,9 +248,12 @@ class GPSLayer(nn.Module):
             self.self_attn_reverse = Mamba(d_model=dim_h, d_state=16, d_conv=4, expand=1)
             if self.fusion_mode == 'gated':
                 self.gate_layer = nn.Linear(dim_h * 2, dim_h)
+            elif self.fusion_mode == 'concat':
+                self.concat_proj = nn.Linear(dim_h * 2, dim_h)
         else:
             self.self_attn_reverse = None
             self.gate_layer = None
+            self.concat_proj = None
 
         # Normalization for MPNN and Self-Attention representations.
         if self.layer_norm:
@@ -800,13 +805,28 @@ class GPSLayer(nn.Module):
 
     def _fuse_mamba_outputs(self, h_fwd, h_rev, batch):
         """Fuse forward and reverse Mamba outputs."""
+        if h_fwd.shape != h_rev.shape:
+            raise ValueError(
+                f"Forward/Reverse Mamba output shape mismatch: {h_fwd.shape} vs {h_rev.shape}"
+            )
+
         if self.fusion_mode == 'fixed':
             h_attn = self.fixed_weight * h_fwd + (1 - self.fixed_weight) * h_rev
         elif self.fusion_mode == 'gated':
-            # Concatenate and apply gate
             combined = torch.cat([h_fwd, h_rev], dim=-1)
             gate = torch.sigmoid(self.gate_layer(combined))
             h_attn = gate * h_fwd + (1 - gate) * h_rev
+        elif self.fusion_mode == 'concat':
+            combined = torch.cat([h_fwd, h_rev], dim=-1)
+            if combined.size(-1) != self.dim_h * 2:
+                raise ValueError(
+                    f"Concat fusion expected last dim {self.dim_h * 2}, got {combined.size(-1)}"
+                )
+            h_attn = self.concat_proj(combined)
+            if h_attn.size(-1) != self.dim_h:
+                raise ValueError(
+                    f"Concat projection expected output dim {self.dim_h}, got {h_attn.size(-1)}"
+                )
         else:
             raise ValueError(f"Unsupported fusion_mode: {self.fusion_mode}")
         return h_attn
