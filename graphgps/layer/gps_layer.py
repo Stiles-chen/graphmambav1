@@ -7,7 +7,7 @@ import torch_geometric.nn as pygnn
 from performer_pytorch import SelfAttention
 from torch_geometric.data import Batch
 from torch_geometric.nn import Linear as Linear_pyg
-from torch_geometric.utils import to_dense_batch
+from torch_geometric.utils import to_dense_batch, scatter
 
 from graphgps.layer.gatedgcn_layer import GatedGCNLayer
 from graphgps.layer.gine_conv_layer import GINEConvESLapPE
@@ -120,7 +120,8 @@ class GPSLayer(nn.Module):
                  local_gnn_type, global_model_type, num_heads,
                  pna_degrees=None, equivstable_pe=False, dropout=0.0,
                  attn_dropout=0.0, layer_norm=False, batch_norm=True,
-                 bigbird_cfg=None, enable_reverse_mamba=False, fusion_mode='fixed', fixed_weight=0.5):
+                 bigbird_cfg=None, enable_reverse_mamba=False, fusion_mode='fixed',
+                 fixed_weight=0.5, scan_target='node'):
         super().__init__()
 
         self.dim_h = dim_h
@@ -134,6 +135,10 @@ class GPSLayer(nn.Module):
         self.self_attn_reverse = None
         self.fusion_mode = fusion_mode
         self.fixed_weight = fixed_weight
+        self.concat_proj = None
+        self.gate_layer = None
+        self.scan_target = scan_target
+        self.edge_scan_input_proj = None
 
         # Local message-passing model.
         if local_gnn_type == 'None':
@@ -246,9 +251,15 @@ class GPSLayer(nn.Module):
             self.self_attn_reverse = Mamba(d_model=dim_h, d_state=16, d_conv=4, expand=1)
             if self.fusion_mode == 'gated':
                 self.gate_layer = nn.Linear(dim_h * 2, dim_h)
+            elif self.fusion_mode == 'concat':
+                self.concat_proj = nn.Linear(dim_h * 2, dim_h)
         else:
             self.self_attn_reverse = None
             self.gate_layer = None
+            self.concat_proj = None
+
+        if self.scan_target == 'edge':
+            self.edge_scan_input_proj = nn.LazyLinear(dim_h)
 
         # Normalization for MPNN and Self-Attention representations.
         if self.layer_norm:
@@ -313,25 +324,29 @@ class GPSLayer(nn.Module):
 
         # Multi-head attention.
         if self.self_attn is not None:
-            if self.global_model_type in ['Transformer', 'Performer', 'BigBird', 'Mamba']:
+            if self.scan_target not in ['node', 'edge']:
+                raise ValueError(f"Unsupported scan_target: {self.scan_target}")
+            if self.scan_target == 'edge' and 'Mamba' in self.global_model_type:
+                h_attn = self._edge_mamba_scan(batch, h)
+            elif self.global_model_type in ['Transformer', 'Performer', 'BigBird', 'Mamba']:
                 h_dense, mask = to_dense_batch(h, batch.batch)
-            if self.global_model_type == 'Transformer':
+            if self.scan_target == 'node' and self.global_model_type == 'Transformer':
                 h_attn = self._sa_block(h_dense, None, ~mask)[mask]
-            elif self.global_model_type == 'Performer':
+            elif self.scan_target == 'node' and self.global_model_type == 'Performer':
                 h_attn = self.self_attn(h_dense, mask=mask)[mask]
-            elif self.global_model_type == 'BigBird':
+            elif self.scan_target == 'node' and self.global_model_type == 'BigBird':
                 h_attn = self.self_attn(h_dense, attention_mask=mask)
 
-            elif self.global_model_type == 'Mamba':
+            elif self.scan_target == 'node' and self.global_model_type == 'Mamba':
                 h_attn = self.self_attn(h_dense)[mask]
 
-            elif self.global_model_type == 'Mamba_Permute':
+            elif self.scan_target == 'node' and self.global_model_type == 'Mamba_Permute':
                 h_ind_perm = permute_within_batch(batch.batch)
                 h_dense, mask = to_dense_batch(h[h_ind_perm], batch.batch[h_ind_perm])
                 h_ind_perm_reverse = torch.argsort(h_ind_perm)
                 h_attn = self.self_attn(h_dense)[mask][h_ind_perm_reverse]
 
-            elif self.global_model_type == 'Mamba_Degree':
+            elif self.scan_target == 'node' and self.global_model_type == 'Mamba_Degree':
                 deg = degree(batch.edge_index[0], batch.x.shape[0]).to(torch.long)
                 h_ind_perm = lexsort([deg, batch.batch])
                 # 确保 h_ind_perm 有效
@@ -359,7 +374,7 @@ class GPSLayer(nn.Module):
                 else:
                     h_attn = self.self_attn(h_dense)[mask][h_ind_perm_reverse]
 
-            elif self.global_model_type == 'Mamba_Hybrid':
+            elif self.scan_target == 'node' and self.global_model_type == 'Mamba_Hybrid':
                 if batch.split == 'train':
                     h_ind_perm = permute_within_batch(batch.batch)
                     h_dense, mask = to_dense_batch(h[h_ind_perm], batch.batch[h_ind_perm])
@@ -375,7 +390,7 @@ class GPSLayer(nn.Module):
                         mamba_arr.append(h_attn)
                     h_attn = sum(mamba_arr) / 5
 
-            elif 'Mamba_Hybrid_Degree' == self.global_model_type:
+            elif self.scan_target == 'node' and 'Mamba_Hybrid_Degree' == self.global_model_type:
                 if batch.split == 'train':
                     h_ind_perm = permute_within_batch(batch.batch)
                     h_dense, mask = to_dense_batch(h[h_ind_perm], batch.batch[h_ind_perm])
@@ -391,7 +406,7 @@ class GPSLayer(nn.Module):
                         mamba_arr.append(h_attn)
                     h_attn = sum(mamba_arr) / 5
 
-            elif 'Mamba_Hybrid_Degree_Noise' == self.global_model_type:
+            elif self.scan_target == 'node' and 'Mamba_Hybrid_Degree_Noise' == self.global_model_type:
                 if batch.split == 'train':
                     deg = degree(batch.edge_index[0], batch.x.shape[0]).to(torch.float)
                     deg_noise = torch.rand_like(deg).to(deg.device)
@@ -435,7 +450,7 @@ class GPSLayer(nn.Module):
                         mamba_arr.append(h_attn)
                     h_attn = sum(mamba_arr) / 5
 
-            elif 'Mamba_Hybrid_Degree_Noise_Bucket' == self.global_model_type:
+            elif self.scan_target == 'node' and 'Mamba_Hybrid_Degree_Noise_Bucket' == self.global_model_type:
                 if batch.split == 'train':
                     deg = degree(batch.edge_index[0], batch.x.shape[0]).to(torch.float)
                     # deg_noise = torch.std(deg)*torch.randn(deg.shape).to(deg.device)
@@ -758,7 +773,7 @@ class GPSLayer(nn.Module):
                 h_dense, mask = to_dense_batch(h[aug_idx], batch.batch[aug_idx])
                 aug_idx_reverse = torch.nonzero(aug_mask).squeeze()
                 h_attn = self.self_attn(h_dense)[mask][aug_idx_reverse]
-            else:
+            elif self.scan_target == 'node':
                 raise RuntimeError(f"Unexpected {self.global_model_type}")
 
             h_attn = self.dropout_attn(h_attn)
@@ -800,16 +815,94 @@ class GPSLayer(nn.Module):
 
     def _fuse_mamba_outputs(self, h_fwd, h_rev, batch):
         """Fuse forward and reverse Mamba outputs."""
+        if h_fwd.shape != h_rev.shape:
+            raise ValueError(
+                f"Forward/Reverse Mamba output shape mismatch: {h_fwd.shape} vs {h_rev.shape}"
+            )
+
         if self.fusion_mode == 'fixed':
             h_attn = self.fixed_weight * h_fwd + (1 - self.fixed_weight) * h_rev
         elif self.fusion_mode == 'gated':
-            # Concatenate and apply gate
             combined = torch.cat([h_fwd, h_rev], dim=-1)
             gate = torch.sigmoid(self.gate_layer(combined))
             h_attn = gate * h_fwd + (1 - gate) * h_rev
+        elif self.fusion_mode == 'concat':
+            combined = torch.cat([h_fwd, h_rev], dim=-1)
+            if combined.size(-1) != self.dim_h * 2:
+                raise ValueError(
+                    f"Concat fusion expected last dim {self.dim_h * 2}, got {combined.size(-1)}"
+                )
+            h_attn = self.concat_proj(combined)
+            if h_attn.size(-1) != self.dim_h:
+                raise ValueError(
+                    f"Concat projection expected output dim {self.dim_h}, got {h_attn.size(-1)}"
+                )
         else:
             raise ValueError(f"Unsupported fusion_mode: {self.fusion_mode}")
         return h_attn
+
+    def _edge_mamba_scan(self, batch, h):
+        if 'Mamba' not in self.global_model_type:
+            raise ValueError("edge scan currently supports only Mamba-based global_model_type.")
+        if not hasattr(batch, 'edge_attr') or batch.edge_attr is None:
+            raise ValueError("edge scan requires batch.edge_attr.")
+
+        edge_attr = batch.edge_attr
+        if edge_attr.dim() == 1:
+            edge_attr = edge_attr.unsqueeze(-1)
+        edge_feat = self.edge_scan_input_proj(edge_attr.float())
+
+        edge_order = self._dfs_edge_order(batch.edge_index, batch.batch, h.size(0))
+        edge_feat_perm = edge_feat[edge_order]
+        edge_batch = batch.batch[batch.edge_index[0]][edge_order]
+
+        edge_dense, edge_mask = to_dense_batch(edge_feat_perm, edge_batch)
+        edge_out = self.self_attn(edge_dense)[edge_mask]
+        edge_out = edge_out[torch.argsort(edge_order)]
+        batch.edge_attr = edge_out
+
+        src, dst = batch.edge_index[0], batch.edge_index[1]
+        node_msg = scatter(edge_out, src, dim=0, dim_size=h.size(0), reduce='mean')
+        node_msg = node_msg + scatter(edge_out, dst, dim=0, dim_size=h.size(0), reduce='mean')
+        return node_msg
+
+    def _dfs_edge_order(self, edge_index, node_batch, num_nodes):
+        src = edge_index[0].tolist()
+        dst = edge_index[1].tolist()
+        edge_ids = list(range(edge_index.size(1)))
+        adjacency = [[] for _ in range(num_nodes)]
+        for eid, (u, v) in enumerate(zip(src, dst)):
+            adjacency[u].append((v, eid))
+
+        order = []
+        unique_graphs = torch.unique(node_batch).tolist()
+        for gid in unique_graphs:
+            nodes = torch.where(node_batch == gid)[0].tolist()
+            if not nodes:
+                continue
+            visited_nodes = set()
+            used_edges = set()
+            for start in nodes:
+                if start in visited_nodes:
+                    continue
+                stack = [start]
+                while stack:
+                    cur = stack.pop()
+                    if cur in visited_nodes:
+                        continue
+                    visited_nodes.add(cur)
+                    neigh = adjacency[cur]
+                    for nxt, eid in reversed(neigh):
+                        if eid not in used_edges:
+                            order.append(eid)
+                            used_edges.add(eid)
+                        if nxt not in visited_nodes and node_batch[nxt].item() == gid:
+                            stack.append(nxt)
+
+        if len(order) < len(edge_ids):
+            used = set(order)
+            order.extend([eid for eid in edge_ids if eid not in used])
+        return torch.tensor(order, device=edge_index.device, dtype=torch.long)
 
     def extra_repr(self):
         s = f'summary: dim_h={self.dim_h}, ' \

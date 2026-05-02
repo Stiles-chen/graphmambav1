@@ -51,6 +51,11 @@ def set_cfg_gt(cfg):
     cfg.gt.layer_norm = False
 
     cfg.gt.batch_norm = True
+    cfg.gt.enable_reverse_mamba = False
+    cfg.gt.fusion_mode = 'fixed'
+    cfg.gt.fixed_weight = 0.5
+    # 'node': use existing node scan path; 'edge': use edge scan path for Mamba.
+    cfg.gt.scan_target = 'node'
 
     cfg.gt.residual = True
 

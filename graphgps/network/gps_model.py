@@ -96,6 +96,7 @@ class GPSModel(torch.nn.Module):
                 enable_reverse_mamba=cfg.gt.enable_reverse_mamba,
                 fusion_mode=cfg.gt.fusion_mode,
                 fixed_weight=cfg.gt.fixed_weight,
+                scan_target=cfg.gt.scan_target,
             ))
         self.layers = torch.nn.Sequential(*layers)
 
