@@ -383,6 +383,20 @@ class GPSLayer(nn.Module):
                 else:
                     h_attn = self.self_attn(h_dense)[mask][h_ind_perm_reverse]
 
+            elif self.scan_target == 'node' and self.global_model_type == 'Mamba_DFS':
+                h_ind_perm = self._dfs_node_order(batch.edge_index, batch.batch, h.size(0))
+                h_dense, mask = to_dense_batch(h[h_ind_perm], batch.batch[h_ind_perm])
+                h_ind_perm_reverse = torch.argsort(h_ind_perm)
+                if self.enable_reverse_mamba:
+                    h_ind_perm_rev = torch.flip(h_ind_perm, dims=[0]).contiguous()
+                    h_dense_rev, mask_rev = to_dense_batch(h[h_ind_perm_rev], batch.batch[h_ind_perm_rev])
+                    h_ind_perm_rev_reverse = torch.argsort(h_ind_perm_rev)
+                    h_fwd = self.self_attn(h_dense)[mask][h_ind_perm_reverse]
+                    h_rev = self.self_attn_reverse(h_dense_rev)[mask_rev][h_ind_perm_rev_reverse]
+                    h_attn = self._fuse_mamba_outputs(h_fwd, h_rev, batch)
+                else:
+                    h_attn = self.self_attn(h_dense)[mask][h_ind_perm_reverse]
+
             elif self.scan_target == 'node' and self.global_model_type == 'Mamba_Hybrid':
                 if batch.split == 'train':
                     h_ind_perm = permute_within_batch(batch.batch)
@@ -915,6 +929,39 @@ class GPSLayer(nn.Module):
         if len(order) < len(edge_ids):
             used = set(order)
             order.extend([eid for eid in edge_ids if eid not in used])
+        return torch.tensor(order, device=edge_index.device, dtype=torch.long)
+
+    def _dfs_node_order(self, edge_index, node_batch, num_nodes):
+        src = edge_index[0].tolist()
+        dst = edge_index[1].tolist()
+        adjacency = [[] for _ in range(num_nodes)]
+        for u, v in zip(src, dst):
+            adjacency[u].append(v)
+
+        order = []
+        unique_graphs = torch.unique(node_batch).tolist()
+        for gid in unique_graphs:
+            nodes = torch.where(node_batch == gid)[0].tolist()
+            if not nodes:
+                continue
+            visited = set()
+            node_set = set(nodes)
+            for start in nodes:
+                if start in visited:
+                    continue
+                stack = [start]
+                while stack:
+                    cur = stack.pop()
+                    if cur in visited:
+                        continue
+                    visited.add(cur)
+                    order.append(cur)
+                    for nxt in reversed(adjacency[cur]):
+                        if nxt in node_set and nxt not in visited:
+                            stack.append(nxt)
+            for n in nodes:
+                if n not in visited:
+                    order.append(n)
         return torch.tensor(order, device=edge_index.device, dtype=torch.long)
 
     def extra_repr(self):
