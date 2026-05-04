@@ -865,7 +865,11 @@ class GPSLayer(nn.Module):
             )
         edge_feat = self.edge_scan_input_proj(edge_attr.float())
 
-        edge_order = self._dfs_edge_order(batch.edge_index, batch.batch, h.size(0))
+        if hasattr(batch, 'dfs_edge_order') and batch.dfs_edge_order is not None \
+                and batch.dfs_edge_order.numel() == batch.edge_index.size(1):
+            edge_order = batch.dfs_edge_order.to(batch.edge_index.device)
+        else:
+            edge_order = self._dfs_edge_order(batch.edge_index, batch.batch, h.size(0))
         edge_feat_perm = edge_feat[edge_order]
         edge_batch = batch.batch[batch.edge_index[0]][edge_order]
 
