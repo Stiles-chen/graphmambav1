@@ -299,6 +299,16 @@ class GPSLayer(nn.Module):
 
     def forward(self, batch):
         h = batch.x
+        edge_index = batch.edge_index
+        num_nodes = h.size(0)
+        valid_edge_mask = (
+            (edge_index[0] >= 0) & (edge_index[0] < num_nodes) &
+            (edge_index[1] >= 0) & (edge_index[1] < num_nodes)
+        )
+        if not bool(valid_edge_mask.all()):
+            batch.edge_index = edge_index[:, valid_edge_mask]
+            if hasattr(batch, 'edge_attr') and batch.edge_attr is not None:
+                batch.edge_attr = batch.edge_attr[valid_edge_mask]
         h_in1 = h  # for first residual connection
         h_out_list = []
         # Local MPNN with edge attributes.
