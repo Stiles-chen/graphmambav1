@@ -932,16 +932,19 @@ class GPSLayer(nn.Module):
         return torch.tensor(order, device=edge_index.device, dtype=torch.long)
 
     def _dfs_node_order(self, edge_index, node_batch, num_nodes):
-        src = edge_index[0].tolist()
-        dst = edge_index[1].tolist()
+        edge_index_cpu = edge_index.detach().cpu()
+        node_batch_cpu = node_batch.detach().cpu()
+        src = edge_index_cpu[0].tolist()
+        dst = edge_index_cpu[1].tolist()
         adjacency = [[] for _ in range(num_nodes)]
         for u, v in zip(src, dst):
-            adjacency[u].append(v)
+            if 0 <= u < num_nodes and 0 <= v < num_nodes:
+                adjacency[u].append(v)
 
         order = []
-        unique_graphs = torch.unique(node_batch).tolist()
+        unique_graphs = torch.unique(node_batch_cpu).tolist()
         for gid in unique_graphs:
-            nodes = torch.where(node_batch == gid)[0].tolist()
+            nodes = torch.where(node_batch_cpu == gid)[0].tolist()
             if not nodes:
                 continue
             visited = set()
@@ -962,7 +965,18 @@ class GPSLayer(nn.Module):
             for n in nodes:
                 if n not in visited:
                     order.append(n)
-        return torch.tensor(order, device=edge_index.device, dtype=torch.long)
+
+        if len(order) != num_nodes:
+            used = set(order)
+            order.extend([n for n in range(num_nodes) if n not in used])
+
+        order_tensor = torch.tensor(order, device=edge_index.device, dtype=torch.long)
+        if order_tensor.min() < 0 or order_tensor.max() >= num_nodes:
+            raise ValueError(
+                f"DFS node order out of bounds: min={order_tensor.min().item()}, "
+                f"max={order_tensor.max().item()}, num_nodes={num_nodes}"
+            )
+        return order_tensor
 
     def extra_repr(self):
         s = f'summary: dim_h={self.dim_h}, ' \
