@@ -299,16 +299,6 @@ class GPSLayer(nn.Module):
 
     def forward(self, batch):
         h = batch.x
-        edge_index = batch.edge_index
-        num_nodes = h.size(0)
-        valid_edge_mask = (
-            (edge_index[0] >= 0) & (edge_index[0] < num_nodes) &
-            (edge_index[1] >= 0) & (edge_index[1] < num_nodes)
-        )
-        if not bool(valid_edge_mask.all()):
-            batch.edge_index = edge_index[:, valid_edge_mask]
-            if hasattr(batch, 'edge_attr') and batch.edge_attr is not None:
-                batch.edge_attr = batch.edge_attr[valid_edge_mask]
         h_in1 = h  # for first residual connection
         h_out_list = []
         # Local MPNN with edge attributes.
@@ -386,24 +376,6 @@ class GPSLayer(nn.Module):
                     _, batch_perm_rev_remapped = torch.unique(batch_perm_rev_cpu, return_inverse=True)
                     batch_perm_rev_remapped = batch_perm_rev_remapped.to(batch_perm_rev.device)
                     h_dense_rev, mask_rev = to_dense_batch(h[h_ind_perm_rev], batch_perm_rev_remapped)
-                    h_ind_perm_rev_reverse = torch.argsort(h_ind_perm_rev)
-                    h_fwd = self.self_attn(h_dense)[mask][h_ind_perm_reverse]
-                    h_rev = self.self_attn_reverse(h_dense_rev)[mask_rev][h_ind_perm_rev_reverse]
-                    h_attn = self._fuse_mamba_outputs(h_fwd, h_rev, batch)
-                else:
-                    h_attn = self.self_attn(h_dense)[mask][h_ind_perm_reverse]
-
-            elif self.scan_target == 'node' and self.global_model_type == 'Mamba_DFS':
-                h_ind_perm = self._dfs_node_order(batch.edge_index, batch.batch, h.size(0))
-                if h_ind_perm.numel() != h.size(0):
-                    h_ind_perm = torch.arange(h.size(0), device=h.device)
-                if h_ind_perm.min() < 0 or h_ind_perm.max() >= h.size(0):
-                    h_ind_perm = torch.arange(h.size(0), device=h.device)
-                h_dense, mask = to_dense_batch(h[h_ind_perm], batch.batch[h_ind_perm])
-                h_ind_perm_reverse = torch.argsort(h_ind_perm)
-                if self.enable_reverse_mamba:
-                    h_ind_perm_rev = torch.flip(h_ind_perm, dims=[0]).contiguous()
-                    h_dense_rev, mask_rev = to_dense_batch(h[h_ind_perm_rev], batch.batch[h_ind_perm_rev])
                     h_ind_perm_rev_reverse = torch.argsort(h_ind_perm_rev)
                     h_fwd = self.self_attn(h_dense)[mask][h_ind_perm_reverse]
                     h_rev = self.self_attn_reverse(h_dense_rev)[mask_rev][h_ind_perm_rev_reverse]
@@ -944,57 +916,6 @@ class GPSLayer(nn.Module):
             used = set(order)
             order.extend([eid for eid in edge_ids if eid not in used])
         return torch.tensor(order, device=edge_index.device, dtype=torch.long)
-
-    def _dfs_node_order(self, edge_index, node_batch, num_nodes):
-        edge_index_cpu = edge_index.detach().clone().to('cpu', non_blocking=False)
-        node_batch_cpu = node_batch.detach().clone().to('cpu', non_blocking=False)
-        src = edge_index_cpu[0].tolist()
-        dst = edge_index_cpu[1].tolist()
-        adjacency = [[] for _ in range(num_nodes)]
-        for u, v in zip(src, dst):
-            if 0 <= u < num_nodes and 0 <= v < num_nodes:
-                adjacency[u].append(v)
-
-        order = []
-        unique_graphs = torch.unique(node_batch_cpu).tolist()
-        for gid in unique_graphs:
-            nodes = torch.where(node_batch_cpu == gid)[0].tolist()
-            if not nodes:
-                continue
-            visited = set()
-            node_set = set(nodes)
-            for start in nodes:
-                if start in visited:
-                    continue
-                stack = [start]
-                while stack:
-                    cur = stack.pop()
-                    if cur in visited:
-                        continue
-                    visited.add(cur)
-                    order.append(cur)
-                    for nxt in reversed(adjacency[cur]):
-                        if nxt in node_set and nxt not in visited:
-                            stack.append(nxt)
-            for n in nodes:
-                if n not in visited:
-                    order.append(n)
-
-        if len(order) != num_nodes:
-            used = set(order)
-            order.extend([n for n in range(num_nodes) if n not in used])
-        else:
-            used = set(order)
-            if len(used) != num_nodes:
-                order = list(range(num_nodes))
-
-        order_tensor = torch.tensor(order, device=edge_index.device, dtype=torch.long)
-        if order_tensor.min() < 0 or order_tensor.max() >= num_nodes:
-            raise ValueError(
-                f"DFS node order out of bounds: min={order_tensor.min().item()}, "
-                f"max={order_tensor.max().item()}, num_nodes={num_nodes}"
-            )
-        return order_tensor
 
     def extra_repr(self):
         s = f'summary: dim_h={self.dim_h}, ' \
