@@ -856,6 +856,20 @@ class GPSLayer(nn.Module):
         if not hasattr(batch, 'edge_attr') or batch.edge_attr is None:
             raise ValueError("edge scan requires batch.edge_attr.")
 
+        edge_index = batch.edge_index
+        num_nodes = h.size(0)
+        valid_edge_mask = (
+            (edge_index[0] >= 0) & (edge_index[0] < num_nodes) &
+            (edge_index[1] >= 0) & (edge_index[1] < num_nodes)
+        )
+        if not bool(valid_edge_mask.all()):
+            edge_index = edge_index[:, valid_edge_mask]
+            batch.edge_index = edge_index
+            if batch.edge_attr is not None:
+                batch.edge_attr = batch.edge_attr[valid_edge_mask]
+            if hasattr(batch, 'dfs_edge_order'):
+                delattr(batch, 'dfs_edge_order')
+
         edge_attr = batch.edge_attr
         if edge_attr.dim() == 1:
             edge_attr = edge_attr.unsqueeze(-1)
@@ -870,6 +884,7 @@ class GPSLayer(nn.Module):
             edge_order = batch.dfs_edge_order.to(batch.edge_index.device)
         else:
             edge_order = self._dfs_edge_order(batch.edge_index, batch.batch, h.size(0))
+        edge_order = self._sanitize_edge_order(edge_order, batch.edge_index.size(1), batch.edge_index.device)
         edge_feat_perm = edge_feat[edge_order]
         edge_batch = batch.batch[batch.edge_index[0]][edge_order]
 
@@ -882,6 +897,22 @@ class GPSLayer(nn.Module):
         node_msg = scatter_mean_fallback(edge_out, src, dim_size=h.size(0))
         node_msg = node_msg + scatter_mean_fallback(edge_out, dst, dim_size=h.size(0))
         return node_msg
+
+    def _sanitize_edge_order(self, edge_order, num_edges, device):
+        if num_edges == 0:
+            return torch.empty(0, dtype=torch.long, device=device)
+        edge_order = edge_order.long()
+        valid = (edge_order >= 0) & (edge_order < num_edges)
+        edge_order = edge_order[valid]
+        if edge_order.numel() == 0:
+            return torch.arange(num_edges, device=device)
+        edge_order = torch.unique(edge_order, sorted=False)
+        if edge_order.numel() < num_edges:
+            seen = torch.zeros(num_edges, dtype=torch.bool, device=device)
+            seen[edge_order] = True
+            missing = torch.arange(num_edges, device=device)[~seen]
+            edge_order = torch.cat([edge_order, missing], dim=0)
+        return edge_order
 
     def _dfs_edge_order(self, edge_index, node_batch, num_nodes):
         src = edge_index[0].tolist()
