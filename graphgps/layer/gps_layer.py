@@ -268,7 +268,7 @@ class GPSLayer(nn.Module):
             self.concat_proj = None
 
         if self.scan_target == 'edge':
-            self.edge_scan_input_proj = nn.LazyLinear(dim_h)
+            self.edge_scan_input_proj = None
 
         # Normalization for MPNN and Self-Attention representations.
         if self.layer_norm:
@@ -859,6 +859,10 @@ class GPSLayer(nn.Module):
         edge_attr = batch.edge_attr
         if edge_attr.dim() == 1:
             edge_attr = edge_attr.unsqueeze(-1)
+        if self.edge_scan_input_proj is None:
+            self.edge_scan_input_proj = nn.Linear(
+                edge_attr.size(-1), self.dim_h, device=edge_attr.device
+            )
         edge_feat = self.edge_scan_input_proj(edge_attr.float())
 
         edge_order = self._dfs_edge_order(batch.edge_index, batch.batch, h.size(0))
