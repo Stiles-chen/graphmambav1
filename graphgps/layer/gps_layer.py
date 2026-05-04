@@ -385,6 +385,10 @@ class GPSLayer(nn.Module):
 
             elif self.scan_target == 'node' and self.global_model_type == 'Mamba_DFS':
                 h_ind_perm = self._dfs_node_order(batch.edge_index, batch.batch, h.size(0))
+                if h_ind_perm.numel() != h.size(0):
+                    h_ind_perm = torch.arange(h.size(0), device=h.device)
+                if h_ind_perm.min() < 0 or h_ind_perm.max() >= h.size(0):
+                    h_ind_perm = torch.arange(h.size(0), device=h.device)
                 h_dense, mask = to_dense_batch(h[h_ind_perm], batch.batch[h_ind_perm])
                 h_ind_perm_reverse = torch.argsort(h_ind_perm)
                 if self.enable_reverse_mamba:
@@ -932,8 +936,8 @@ class GPSLayer(nn.Module):
         return torch.tensor(order, device=edge_index.device, dtype=torch.long)
 
     def _dfs_node_order(self, edge_index, node_batch, num_nodes):
-        edge_index_cpu = edge_index.detach().cpu()
-        node_batch_cpu = node_batch.detach().cpu()
+        edge_index_cpu = edge_index.detach().clone().to('cpu', non_blocking=False)
+        node_batch_cpu = node_batch.detach().clone().to('cpu', non_blocking=False)
         src = edge_index_cpu[0].tolist()
         dst = edge_index_cpu[1].tolist()
         adjacency = [[] for _ in range(num_nodes)]
@@ -969,6 +973,10 @@ class GPSLayer(nn.Module):
         if len(order) != num_nodes:
             used = set(order)
             order.extend([n for n in range(num_nodes) if n not in used])
+        else:
+            used = set(order)
+            if len(used) != num_nodes:
+                order = list(range(num_nodes))
 
         order_tensor = torch.tensor(order, device=edge_index.device, dtype=torch.long)
         if order_tensor.min() < 0 or order_tensor.max() >= num_nodes:
