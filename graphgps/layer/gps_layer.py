@@ -805,6 +805,7 @@ class GPSLayer(nn.Module):
 
             h_attn = self.dropout_attn(h_attn)
             h_attn = h_in1 + h_attn  # Residual connection.
+            h_attn = torch.nan_to_num(h_attn, nan=0.0, posinf=1e4, neginf=-1e4)
             if self.layer_norm:
                 h_attn = self.norm1_attn(h_attn, batch.batch)
             if self.batch_norm:
@@ -896,6 +897,7 @@ class GPSLayer(nn.Module):
                 edge_attr.size(-1), self.dim_h, device=edge_attr.device
             )
         edge_feat = self.edge_scan_input_proj(edge_attr.float())
+        edge_feat = torch.nan_to_num(edge_feat, nan=0.0, posinf=1e4, neginf=-1e4)
 
         if hasattr(batch, 'dfs_edge_order') and batch.dfs_edge_order is not None \
                 and batch.dfs_edge_order.numel() == batch.edge_index.size(1):
@@ -908,12 +910,14 @@ class GPSLayer(nn.Module):
 
         edge_dense, edge_mask = to_dense_batch(edge_feat_perm, edge_batch)
         edge_out = self.self_attn(edge_dense)[edge_mask]
+        edge_out = torch.nan_to_num(edge_out, nan=0.0, posinf=1e4, neginf=-1e4)
         edge_out = edge_out[torch.argsort(edge_order)]
         batch.edge_attr = edge_out
 
         src, dst = batch.edge_index[0], batch.edge_index[1]
         node_msg = scatter_mean_fallback(edge_out, src, dim_size=h.size(0))
         node_msg = node_msg + scatter_mean_fallback(edge_out, dst, dim_size=h.size(0))
+        node_msg = torch.nan_to_num(node_msg, nan=0.0, posinf=1e4, neginf=-1e4)
         return node_msg
 
     def _sanitize_edge_order(self, edge_order, num_edges, device):
