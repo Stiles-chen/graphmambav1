@@ -117,6 +117,50 @@ def add_dfs_edge_order(data):
     data.dfs_edge_order = torch.tensor(order, dtype=torch.long)
     return data
 
+
+def add_dfs_node_order(data):
+    """Precompute and cache DFS node traversal order for each graph sample."""
+    if hasattr(data, 'num_nodes') and data.num_nodes is not None:
+        num_nodes = int(data.num_nodes)
+    elif hasattr(data, 'x') and data.x is not None:
+        num_nodes = int(data.x.size(0))
+    else:
+        return data
+    if num_nodes == 0:
+        data.dfs_node_order = torch.empty(0, dtype=torch.long)
+        return data
+    if not hasattr(data, 'edge_index') or data.edge_index is None or data.edge_index.numel() == 0:
+        data.dfs_node_order = torch.arange(num_nodes, dtype=torch.long)
+        return data
+
+    edge_index = data.edge_index.cpu()
+    src = edge_index[0].tolist()
+    dst = edge_index[1].tolist()
+    adjacency = [[] for _ in range(num_nodes)]
+    for u, v in zip(src, dst):
+        if 0 <= u < num_nodes and 0 <= v < num_nodes:
+            adjacency[u].append(v)
+
+    order, visited = [], set()
+    for start in range(num_nodes):
+        if start in visited:
+            continue
+        stack = [start]
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            order.append(cur)
+            for nxt in reversed(adjacency[cur]):
+                if nxt not in visited:
+                    stack.append(nxt)
+    if len(order) < num_nodes:
+        missing = [n for n in range(num_nodes) if n not in visited]
+        order.extend(missing)
+    data.dfs_node_order = torch.tensor(order, dtype=torch.long)
+    return data
+
 def clip_graphs_to_size(data, size_limit=5000):
     if hasattr(data, 'num_nodes'):
         N = data.num_nodes  # Explicitly given number of nodes, e.g. ogbg-ppa

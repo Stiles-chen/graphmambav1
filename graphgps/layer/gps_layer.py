@@ -382,6 +382,24 @@ class GPSLayer(nn.Module):
                     h_attn = self._fuse_mamba_outputs(h_fwd, h_rev, batch)
                 else:
                     h_attn = self.self_attn(h_dense)[mask][h_ind_perm_reverse]
+            elif self.scan_target == 'node' and self.global_model_type == 'Mamba_DFS':
+                if hasattr(batch, 'dfs_node_order') and batch.dfs_node_order is not None \
+                        and batch.dfs_node_order.numel() == h.size(0):
+                    h_ind_perm = batch.dfs_node_order.to(h.device)
+                else:
+                    h_ind_perm = self._dfs_node_order(batch.edge_index, batch.batch, h.size(0))
+                h_ind_perm = self._sanitize_node_order(h_ind_perm, h.size(0), h.device)
+                h_dense, mask = to_dense_batch(h[h_ind_perm], batch.batch[h_ind_perm])
+                h_ind_perm_reverse = torch.argsort(h_ind_perm)
+                if self.enable_reverse_mamba:
+                    h_ind_perm_rev = torch.flip(h_ind_perm, dims=[0]).contiguous()
+                    h_dense_rev, mask_rev = to_dense_batch(h[h_ind_perm_rev], batch.batch[h_ind_perm_rev])
+                    h_ind_perm_rev_reverse = torch.argsort(h_ind_perm_rev)
+                    h_fwd = self.self_attn(h_dense)[mask][h_ind_perm_reverse]
+                    h_rev = self.self_attn_reverse(h_dense_rev)[mask_rev][h_ind_perm_rev_reverse]
+                    h_attn = self._fuse_mamba_outputs(h_fwd, h_rev, batch)
+                else:
+                    h_attn = self.self_attn(h_dense)[mask][h_ind_perm_reverse]
 
             elif self.scan_target == 'node' and self.global_model_type == 'Mamba_Hybrid':
                 if batch.split == 'train':
@@ -913,6 +931,56 @@ class GPSLayer(nn.Module):
             missing = torch.arange(num_edges, device=device)[~seen]
             edge_order = torch.cat([edge_order, missing], dim=0)
         return edge_order
+
+    def _sanitize_node_order(self, node_order, num_nodes, device):
+        if num_nodes == 0:
+            return torch.empty(0, dtype=torch.long, device=device)
+        node_order = node_order.long()
+        valid = (node_order >= 0) & (node_order < num_nodes)
+        node_order = node_order[valid]
+        if node_order.numel() == 0:
+            return torch.arange(num_nodes, device=device)
+        node_order = torch.unique(node_order, sorted=False)
+        if node_order.numel() < num_nodes:
+            seen = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+            seen[node_order] = True
+            missing = torch.arange(num_nodes, device=device)[~seen]
+            node_order = torch.cat([node_order, missing], dim=0)
+        return node_order
+
+    def _dfs_node_order(self, edge_index, node_batch, num_nodes):
+        edge_index_cpu = edge_index.detach().cpu()
+        node_batch_cpu = node_batch.detach().cpu()
+        src = edge_index_cpu[0].tolist()
+        dst = edge_index_cpu[1].tolist()
+        adjacency = [[] for _ in range(num_nodes)]
+        for u, v in zip(src, dst):
+            if 0 <= u < num_nodes and 0 <= v < num_nodes:
+                adjacency[u].append(v)
+
+        order = []
+        unique_graphs = torch.unique(node_batch_cpu).tolist()
+        for gid in unique_graphs:
+            nodes = torch.where(node_batch_cpu == gid)[0].tolist()
+            visited = set()
+            node_set = set(nodes)
+            for start in nodes:
+                if start in visited:
+                    continue
+                stack = [start]
+                while stack:
+                    cur = stack.pop()
+                    if cur in visited:
+                        continue
+                    visited.add(cur)
+                    order.append(cur)
+                    for nxt in reversed(adjacency[cur]):
+                        if nxt in node_set and nxt not in visited:
+                            stack.append(nxt)
+            for n in nodes:
+                if n not in visited:
+                    order.append(n)
+        return torch.tensor(order, device=edge_index.device, dtype=torch.long)
 
     def _dfs_edge_order(self, edge_index, node_batch, num_nodes):
         src = edge_index[0].tolist()

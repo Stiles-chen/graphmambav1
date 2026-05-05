@@ -28,7 +28,7 @@ from graphgps.transform.transforms import (pre_transform_in_memory,
                                            generate_splits, # not the same as split_generator above.
                                            typecast_x, concat_x_and_pos,
                                            clip_graphs_to_size, move_node_feat_to_x,
-                                           add_dfs_edge_order)
+                                           add_dfs_edge_order, add_dfs_node_order)
 from graphgps.transform.expander_edges import generate_random_expander
 from graphgps.transform.dist_transforms import (add_dist_features, add_reverse_edges,
                                                  add_self_loops, effective_resistances, 
@@ -253,6 +253,17 @@ def load_dataset_master(format, name, dataset_dir):
         logging.info("Precomputing DFS edge order for edge-scan Mamba ...")
         pre_transform_in_memory(dataset,
                                 add_dfs_edge_order,
+                                show_progress=True)
+        elapsed = time.perf_counter() - start
+        timestr = time.strftime('%H:%M:%S', time.gmtime(elapsed)) \
+                  + f'{elapsed:.2f}'[-3:]
+        logging.info(f"Done! Took {timestr}")
+
+    if cfg.gt.scan_target == 'node' and 'Mamba_DFS' in cfg.gt.layer_type:
+        start = time.perf_counter()
+        logging.info("Precomputing DFS node order for node-scan Mamba_DFS ...")
+        pre_transform_in_memory(dataset,
+                                add_dfs_node_order,
                                 show_progress=True)
         elapsed = time.perf_counter() - start
         timestr = time.strftime('%H:%M:%S', time.gmtime(elapsed)) \
