@@ -73,11 +73,24 @@ def move_node_feat_to_x(data):
 
 
 def add_dfs_edge_order(data):
-    """Precompute and cache DFS edge traversal order for each graph sample."""
+    """Precompute and cache DFS edge traversal order for each graph sample.
+
+    IMPORTANT:
+    - `data.dfs_edge_order` is an *edge-index permutation* of length E (values 0..E-1).
+      This is convenient for single-graph processing, but it does not survive PyG
+      batching correctly unless special collation rules are added.
+    - `data.dfs_edge_rank` is an *edge rank* (also length E) where
+      `dfs_edge_rank[eid] = position of eid in dfs_edge_order`.
+      This representation is stable under batching, because it is per-edge and
+      does not require any edge-id offset.
+
+    The edge-scan Mamba path should prefer `dfs_edge_rank`.
+    """
     if not hasattr(data, 'edge_index') or data.edge_index is None:
         return data
     if data.edge_index.numel() == 0:
         data.dfs_edge_order = torch.empty(0, dtype=torch.long)
+        data.dfs_edge_rank = torch.empty(0, dtype=torch.long)
         return data
 
     if hasattr(data, 'num_nodes') and data.num_nodes is not None:
@@ -114,7 +127,17 @@ def add_dfs_edge_order(data):
     if len(order) < data.edge_index.size(1):
         all_edges = set(range(data.edge_index.size(1)))
         order.extend(sorted(list(all_edges - used_edges)))
-    data.dfs_edge_order = torch.tensor(order, dtype=torch.long)
+
+    # Cache both representations:
+    # - order: permutation of edge ids
+    # - rank:  per-edge rank used for stable batching
+    order_t = torch.tensor(order, dtype=torch.long)
+    data.dfs_edge_order = order_t
+    # dfs_edge_rank[eid] = rank position
+    num_edges = int(data.edge_index.size(1))
+    rank_t = torch.empty(num_edges, dtype=torch.long)
+    rank_t[order_t] = torch.arange(num_edges, dtype=torch.long)
+    data.dfs_edge_rank = rank_t
     return data
 
 
