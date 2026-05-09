@@ -350,22 +350,40 @@ class GPSLayer(nn.Module):
         # Pre-compute orderings once to avoid redundant DFS calculations across layers
         # Use global cache with graph structure hashing to enable cross-batch reuse
         if hasattr(batch, 'edge_index') and batch.edge_index.numel() > 0:
-            # Pre-compute edge ordering for edge scan
+            # Pre-compute edge ordering for edge scan only when the loader did
+            # not already attach a stable per-edge DFS rank/order.  When
+            # `dfs_edge_rank` exists, `_edge_mamba_scan()` can derive and cache
+            # the batched edge order without running DFS again.
             if self.scan_target in ['edge', 'both'] and not hasattr(batch, '_cached_edge_order'):
                 num_edges = int(batch.edge_index.size(1))
-                # Use global cache with graph structure hashing
-                cache_key = _get_graph_structure_hash(batch.edge_index, batch.batch, h.size(0))
-                
-                if cache_key not in _dfs_cache_dict:
-                    # Cache miss: compute DFS
-                    edge_order = self._dfs_edge_order(batch.edge_index, batch.batch, h.size(0))
-                    edge_order = self._sanitize_edge_order(edge_order, num_edges, device=torch.device('cpu'))
-                    _dfs_cache_dict[cache_key] = edge_order
-                else:
-                    # Cache hit: reuse DFS order
-                    edge_order = _dfs_cache_dict[cache_key]
-                
-                batch._cached_edge_order = edge_order.to(batch.edge_index.device, non_blocking=True)
+                dfs_edge_rank = getattr(batch, 'dfs_edge_rank', None)
+                dfs_edge_order = getattr(batch, 'dfs_edge_order', None)
+                has_precomputed_rank = (
+                    torch.is_tensor(dfs_edge_rank)
+                    and dfs_edge_rank.numel() == num_edges
+                )
+                has_precomputed_order = (
+                    dfs_edge_order is not None
+                    and self._is_valid_permutation_1d(dfs_edge_order, num_edges)
+                )
+
+                if not has_precomputed_rank and not has_precomputed_order:
+                    # Use global cache with graph structure hashing only as a
+                    # fallback for batches that were not preprocessed by the
+                    # loader.  Hashing also has O(E) CPU/Python cost, so avoid
+                    # it when offline DFS metadata is available.
+                    cache_key = _get_graph_structure_hash(batch.edge_index, batch.batch, h.size(0))
+
+                    if cache_key not in _dfs_cache_dict:
+                        # Cache miss: compute DFS
+                        edge_order = self._dfs_edge_order(batch.edge_index, batch.batch, h.size(0))
+                        edge_order = self._sanitize_edge_order(edge_order, num_edges, device=torch.device('cpu'))
+                        _dfs_cache_dict[cache_key] = edge_order
+                    else:
+                        # Cache hit: reuse DFS order
+                        edge_order = _dfs_cache_dict[cache_key]
+
+                    batch._cached_edge_order = edge_order.to(batch.edge_index.device, non_blocking=True)
 
             # Pre-compute node ordering for node scan (Mamba_DFS variants)
             if (self.global_model_type == 'Mamba_DFS' or 
@@ -664,6 +682,8 @@ class GPSLayer(nn.Module):
                 delattr(batch, 'dfs_edge_order')
             if hasattr(batch, 'dfs_edge_rank'):
                 delattr(batch, 'dfs_edge_rank')
+            if hasattr(batch, '_cached_edge_order'):
+                delattr(batch, '_cached_edge_order')
 
         edge_attr = batch.edge_attr
         if edge_attr.dim() == 1:
@@ -679,29 +699,36 @@ class GPSLayer(nn.Module):
         num_edges = int(edge_index.size(1))
         edge_batch_all = batch.batch[edge_index[0]]
 
-        dfs_edge_rank = getattr(batch, 'dfs_edge_rank', None)
-        if torch.is_tensor(dfs_edge_rank) and dfs_edge_rank.numel() == num_edges:
-            rank = dfs_edge_rank.to(device=edge_batch_all.device, non_blocking=True).view(-1)
-            if rank.dtype != torch.long:
-                rank = rank.to(torch.long)
-            batch_id = edge_batch_all.to(torch.long)
-            stride = (rank.max() + 1).to(torch.long)
-            key = batch_id * stride + rank
-            edge_order = torch.argsort(key)
+        cached_order = getattr(batch, '_cached_edge_order', None)
+        if torch.is_tensor(cached_order) and cached_order.numel() == num_edges:
+            edge_order = cached_order.to(
+                device=edge_index.device, dtype=torch.long, non_blocking=True
+            ).view(-1)
         else:
-            # Try to use cached edge order (computed once in forward() to avoid redundant DFS)
-            dfs_edge_order = getattr(batch, 'dfs_edge_order', None)
-            if dfs_edge_order is not None and self._is_valid_permutation_1d(dfs_edge_order, num_edges):
-                edge_order = dfs_edge_order
+            dfs_edge_rank = getattr(batch, 'dfs_edge_rank', None)
+            if torch.is_tensor(dfs_edge_rank) and dfs_edge_rank.numel() == num_edges:
+                rank = dfs_edge_rank.to(device=edge_batch_all.device, non_blocking=True).view(-1)
+                if rank.dtype != torch.long:
+                    rank = rank.to(torch.long)
+                batch_id = edge_batch_all.to(torch.long)
+                stride = (rank.max() + 1).to(torch.long)
+                key = batch_id * stride + rank
+                edge_order = torch.argsort(key)
             else:
-                # Check for cached edge order first
-                cached_order = getattr(batch, '_cached_edge_order', None)
-                if cached_order is not None and cached_order.numel() == num_edges:
-                    edge_order = cached_order
+                # Try to use the offline per-graph DFS order if present.
+                dfs_edge_order = getattr(batch, 'dfs_edge_order', None)
+                if dfs_edge_order is not None and self._is_valid_permutation_1d(dfs_edge_order, num_edges):
+                    edge_order = dfs_edge_order.to(
+                        device=edge_index.device, dtype=torch.long, non_blocking=True
+                    ).view(-1)
                 else:
                     edge_order = self._dfs_edge_order(edge_index, batch.batch, num_nodes)
                     edge_order = self._sanitize_edge_order(edge_order, num_edges, device=torch.device('cpu'))
                     edge_order = edge_order.to(edge_index.device, non_blocking=True)
+
+            # Cache whichever valid ordering path was used so subsequent GPS
+            # layers on the same PyG Batch do not re-run DFS or re-sort ranks.
+            batch._cached_edge_order = edge_order
 
         edge_feat_perm = edge_feat[edge_order]
         edge_batch = edge_batch_all[edge_order]
