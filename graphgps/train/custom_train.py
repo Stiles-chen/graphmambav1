@@ -15,6 +15,27 @@ from torch_geometric.graphgym.utils.epoch import is_eval_epoch, is_ckpt_epoch
 from graphgps.loss.subtoken_prediction_loss import subtoken_cross_entropy
 from graphgps.utils import cfg_to_dict, flatten_dict, make_wandb_name
 
+
+def _finite_stats(name, tensor):
+    if tensor is None:
+        return f"{name}=None"
+    if not torch.is_tensor(tensor):
+        return f"{name}=not_tensor"
+    t = tensor.detach()
+    finite = torch.isfinite(t)
+    total = t.numel()
+    bad = int((~finite).sum().item())
+    if total == 0:
+        return f"{name}: empty"
+    if bad == total:
+        return f"{name}: bad={bad}/{total} (all non-finite)"
+    ft = t[finite]
+    if not torch.is_floating_point(ft) and not torch.is_complex(ft):
+        ft = ft.to(torch.float32)
+    return (f"{name}: bad={bad}/{total} min={ft.min().item():.4e} "
+            f"max={ft.max().item():.4e} mean={ft.mean().item():.4e} "
+            f"std={ft.std(unbiased=False).item():.4e}")
+
 # from deepspeed.profiling.flops_profiler import FlopsProfiler
 # from torch.autograd import profiler
 #from torch.profiler import profile, record_function, ProfilerActivity
@@ -126,6 +147,20 @@ def _forward_eval_batch(loader, model, batch, split):
 #     return pred, true
 
 def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation):
+    # Always define debug flags up-front to avoid NameError under partial merges.
+    debug_edge_voc = False
+    debug_max_iter = 0
+    try:
+        debug_edge_voc = (
+            getattr(cfg.dataset, 'name', None) == 'edge_wt_region_boundary' and
+            getattr(cfg.gt, 'scan_target', 'node') == 'edge'
+        )
+        debug_max_iter = int(getattr(cfg.train, 'debug_max_iter', 50))
+    except Exception:
+        # Keep training functional even if cfg is partially initialized.
+        debug_edge_voc = False
+        debug_max_iter = 0
+
     # flop related
     if_mem = False
     if_flop = False
@@ -142,6 +177,9 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
     model.train()
     optimizer.zero_grad()
     time_start = time.time()
+    skipped_non_finite_loss = 0
+    skipped_non_finite_grad = 0
+    recovered_non_finite_grad = 0
     for iter, batch in enumerate(loader):
         if if_select:
             ratio = 1.0
@@ -152,8 +190,14 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
             prof.start_profile()
         batch.split = 'train'
         batch.to(torch.device(cfg.device))
+        if debug_edge_voc and iter < debug_max_iter:
+            logging.info(_finite_stats("train.batch.x", getattr(batch, 'x', None)))
+            logging.info(_finite_stats("train.batch.edge_attr", getattr(batch, 'edge_attr', None)))
 
         pred, true = model(batch)
+        if debug_edge_voc and iter < debug_max_iter:
+            logging.info(_finite_stats("train.pred", pred))
+            logging.info(_finite_stats("train.true", true))
         if cfg.dataset.name == 'ogbg-code2':
             loss, pred_score = subtoken_cross_entropy(pred, true)
             _true = true
@@ -179,9 +223,66 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
             if if_select:
                 total_node += batch.x.size(0)
 
+        if not torch.isfinite(loss):
+            skipped_non_finite_loss += 1
+            logging.warning(
+                "Non-finite loss detected at iter %d (split=train). Skipping backward/update for this batch.",
+                iter,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
         loss.backward()
+        if debug_edge_voc and iter < debug_max_iter:
+            bad_names = []
+            for n, p in model.named_parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    bad_names.append(n)
+                    if len(bad_names) >= 5:
+                        break
+            if bad_names:
+                logging.warning("First non-finite grad params (iter=%d): %s", iter, bad_names)
         # Parameters update after accumulating gradients for given num. batches.
         if ((iter + 1) % batch_accumulation == 0) or (iter + 1 == len(loader)):
+            found_non_finite_grad = False
+            for p in model.parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    found_non_finite_grad = True
+                    break
+            if found_non_finite_grad:
+                # Attempt recovery first: sanitize gradients instead of always skipping.
+                # This is useful when forward/loss is finite but a few gradients become NaN/Inf.
+                num_sanitized = 0
+                num_grad_tensors = 0
+                for p in model.parameters():
+                    if p.grad is None:
+                        continue
+                    num_grad_tensors += 1
+                    if not torch.isfinite(p.grad).all():
+                        p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                        num_sanitized += 1
+
+                still_non_finite = False
+                for p in model.parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        still_non_finite = True
+                        break
+
+                if still_non_finite or num_grad_tensors == 0:
+                    skipped_non_finite_grad += 1
+                    logging.warning(
+                        "Non-finite gradients detected at iter %d (split=train). "
+                        "Recovery failed, clearing gradients and skipping optimizer step.",
+                        iter,
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+                recovered_non_finite_grad += 1
+                logging.warning(
+                    "Non-finite gradients detected at iter %d (split=train). "
+                    "Recovered by sanitizing %d grad tensors; continuing with optimizer step.",
+                    iter, num_sanitized
+                )
             if cfg.optim.clip_grad_norm:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -194,6 +295,15 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
                             params=cfg.params,
                             dataset_name=cfg.dataset.name)
         time_start = time.time()
+    if skipped_non_finite_loss > 0 or skipped_non_finite_grad > 0 or recovered_non_finite_grad > 0:
+        logging.warning(
+            "train_epoch summary: skipped %d batches due to non-finite loss, "
+            "skipped %d optimizer steps due to non-finite gradients, "
+            "recovered %d steps via gradient sanitization.",
+            skipped_non_finite_loss,
+            skipped_non_finite_grad,
+            recovered_non_finite_grad,
+        )
     if if_flop:
         print('################ Print flop')
         print(total_flop_s / sample_count, params)
