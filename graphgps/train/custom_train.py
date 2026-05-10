@@ -30,6 +30,8 @@ def _finite_stats(name, tensor):
     if bad == total:
         return f"{name}: bad={bad}/{total} (all non-finite)"
     ft = t[finite]
+    if not torch.is_floating_point(ft) and not torch.is_complex(ft):
+        ft = ft.to(torch.float32)
     return (f"{name}: bad={bad}/{total} min={ft.min().item():.4e} "
             f"max={ft.max().item():.4e} mean={ft.mean().item():.4e} "
             f"std={ft.std(unbiased=False).item():.4e}")
