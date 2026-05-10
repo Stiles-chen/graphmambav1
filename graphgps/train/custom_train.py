@@ -179,6 +179,7 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
     time_start = time.time()
     skipped_non_finite_loss = 0
     skipped_non_finite_grad = 0
+    recovered_non_finite_grad = 0
     for iter, batch in enumerate(loader):
         if if_select:
             ratio = 1.0
@@ -249,14 +250,39 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
                     found_non_finite_grad = True
                     break
             if found_non_finite_grad:
-                skipped_non_finite_grad += 1
+                # Attempt recovery first: sanitize gradients instead of always skipping.
+                # This is useful when forward/loss is finite but a few gradients become NaN/Inf.
+                num_sanitized = 0
+                num_grad_tensors = 0
+                for p in model.parameters():
+                    if p.grad is None:
+                        continue
+                    num_grad_tensors += 1
+                    if not torch.isfinite(p.grad).all():
+                        p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                        num_sanitized += 1
+
+                still_non_finite = False
+                for p in model.parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        still_non_finite = True
+                        break
+
+                if still_non_finite or num_grad_tensors == 0:
+                    skipped_non_finite_grad += 1
+                    logging.warning(
+                        "Non-finite gradients detected at iter %d (split=train). "
+                        "Recovery failed, clearing gradients and skipping optimizer step.",
+                        iter,
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+                recovered_non_finite_grad += 1
                 logging.warning(
                     "Non-finite gradients detected at iter %d (split=train). "
-                    "Clearing gradients and skipping optimizer step.",
-                    iter,
+                    "Recovered by sanitizing %d grad tensors; continuing with optimizer step.",
+                    iter, num_sanitized
                 )
-                optimizer.zero_grad(set_to_none=True)
-                continue
             if cfg.optim.clip_grad_norm:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -269,12 +295,14 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
                             params=cfg.params,
                             dataset_name=cfg.dataset.name)
         time_start = time.time()
-    if skipped_non_finite_loss > 0 or skipped_non_finite_grad > 0:
+    if skipped_non_finite_loss > 0 or skipped_non_finite_grad > 0 or recovered_non_finite_grad > 0:
         logging.warning(
             "train_epoch summary: skipped %d batches due to non-finite loss, "
-            "skipped %d optimizer steps due to non-finite gradients.",
+            "skipped %d optimizer steps due to non-finite gradients, "
+            "recovered %d steps via gradient sanitization.",
             skipped_non_finite_loss,
             skipped_non_finite_grad,
+            recovered_non_finite_grad,
         )
     if if_flop:
         print('################ Print flop')
