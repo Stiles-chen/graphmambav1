@@ -163,9 +163,6 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
     time_start = time.time()
     skipped_non_finite_loss = 0
     skipped_non_finite_grad = 0
-    debug_edge_voc = (cfg.dataset.name == 'edge_wt_region_boundary' and
-                      getattr(cfg.gt, 'scan_target', 'node') == 'edge')
-    debug_max_iter = 50
     for iter, batch in enumerate(loader):
         if if_select:
             ratio = 1.0
