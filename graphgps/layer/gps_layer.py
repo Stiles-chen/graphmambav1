@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import warnings
 from typing import List
-from functools import lru_cache
-import hashlib
 
 import numpy as np
 import torch
@@ -22,9 +20,6 @@ from mamba_ssm import Mamba
 
 # Keep old behavior for reproducibility.
 torch.manual_seed(0)
-
-# Global cache for DFS orders to avoid redundant computation across batches
-_dfs_cache_dict = {}
 
 
 def permute_nodes_within_identity(identities: torch.Tensor) -> torch.Tensor:
@@ -104,29 +99,6 @@ def scatter_mean_fallback(src: torch.Tensor, index: torch.Tensor, dim_size: int)
         return out if src.dim() > 1 else out.squeeze(-1)
 
 
-def _get_graph_structure_hash(edge_index: torch.Tensor, node_batch: torch.Tensor, num_nodes: int) -> str:
-    """Generate a hash for graph structure to enable cross-batch caching.
-
-    This enables caching DFS orders for the same graph structure even when they
-    come in different batches, significantly reducing redundant computation.
-    """
-    # Convert to CPU for hashing to ensure consistency
-    ei = edge_index.detach().cpu()
-    nb = node_batch.detach().cpu()
-
-    # Create a unique hash based on graph topology
-    # We use a simple approach: hash the sorted edge list + batch structure
-    ei_tuple = (tuple(ei[0].tolist()), tuple(ei[1].tolist()), tuple(nb.tolist()), num_nodes)
-    hash_obj = hashlib.md5(str(ei_tuple).encode())
-    return hash_obj.hexdigest()
-
-
-def _clear_dfs_cache():
-    """Clear the global DFS cache. Useful for memory management."""
-    global _dfs_cache_dict
-    _dfs_cache_dict.clear()
-
-
 class GPSLayer(nn.Module):
     """Local MPNN + global sequence model layer.
 
@@ -153,6 +125,7 @@ class GPSLayer(nn.Module):
         fixed_weight: float = 0.5,
         scan_target: str = 'node',
         edge_dim=None,
+        edge_scan_order: str = 'dfs',
     ):
         super().__init__()
 
@@ -173,6 +146,10 @@ class GPSLayer(nn.Module):
         self.scan_target = scan_target
         if self.scan_target not in ['node', 'edge', 'both']:
             raise ValueError(f"Unsupported scan_target: {self.scan_target}")
+
+        self.edge_scan_order = edge_scan_order
+        if self.edge_scan_order not in ['default', 'dfs']:
+            raise ValueError(f"Unsupported edge_scan_order: {self.edge_scan_order}")
 
         # Edge scan input projection.
         if scan_target in ['edge', 'both']:
@@ -319,24 +296,32 @@ class GPSLayer(nn.Module):
 
     @staticmethod
     def _is_valid_permutation_1d(order: torch.Tensor, n: int) -> bool:
-        """CPU-side validation: True iff `order` is a permutation of [0..n-1]."""
+        """Fast validation: True iff `order` is a permutation of [0..n-1].
+
+        Note: This is performance-critical (called inside forward); avoid Python
+        loops / `.tolist()`.
+        """
         if not torch.is_tensor(order):
             return False
+        order = order.view(-1)
         if n == 0:
             return order.numel() == 0
         if order.numel() != n:
             return False
-        try:
-            lst = order.detach().view(-1).cpu().tolist()
-        except Exception:
-            return False
-        used = [False] * n
-        for v in lst:
-            iv = int(v)
-            if iv < 0 or iv >= n or used[iv]:
+        if order.dtype != torch.long:
+            # Still allow int tensors.
+            if not order.dtype.is_floating_point:
+                order = order.to(torch.long)
+            else:
                 return False
-            used[iv] = True
-        return True
+        # Range check.
+        if int(order.min()) < 0 or int(order.max()) >= n:
+            return False
+        # Uniqueness check.
+        # Sort+compare is usually faster than `unique` for this use case.
+        sorted_vals = torch.sort(order).values
+        target = torch.arange(n, device=sorted_vals.device, dtype=sorted_vals.dtype)
+        return bool((sorted_vals == target).all())
 
     def forward(self, batch):
         # Defensive sanitize.
@@ -346,44 +331,6 @@ class GPSLayer(nn.Module):
 
         h_in1 = h
         h_out_list = []
-        
-        # Pre-compute orderings once to avoid redundant DFS calculations across layers
-        # Use global cache with graph structure hashing to enable cross-batch reuse
-        if hasattr(batch, 'edge_index') and batch.edge_index.numel() > 0:
-            # Pre-compute edge ordering for edge scan
-            if self.scan_target in ['edge', 'both'] and not hasattr(batch, '_cached_edge_order'):
-                num_edges = int(batch.edge_index.size(1))
-                # Use global cache with graph structure hashing
-                cache_key = _get_graph_structure_hash(batch.edge_index, batch.batch, h.size(0))
-                
-                if cache_key not in _dfs_cache_dict:
-                    # Cache miss: compute DFS
-                    edge_order = self._dfs_edge_order(batch.edge_index, batch.batch, h.size(0))
-                    edge_order = self._sanitize_edge_order(edge_order, num_edges, device=torch.device('cpu'))
-                    _dfs_cache_dict[cache_key] = edge_order
-                else:
-                    # Cache hit: reuse DFS order
-                    edge_order = _dfs_cache_dict[cache_key]
-                
-                batch._cached_edge_order = edge_order.to(batch.edge_index.device, non_blocking=True)
-
-            # Pre-compute node ordering for node scan (Mamba_DFS variants)
-            if (self.global_model_type == 'Mamba_DFS' or 
-                self.global_model_type == 'Mamba_Hybrid_Degree_Noise' or 
-                self.global_model_type == 'Mamba_Hybrid_Degree_Noise_Bucket') and not hasattr(batch, '_cached_node_order'):
-                dfs_attr = getattr(batch, 'dfs_node_order', None)
-                if dfs_attr is None or not self._is_valid_permutation_1d(dfs_attr, h.size(0)):
-                    # Use global cache for node ordering too
-                    cache_key = _get_graph_structure_hash(batch.edge_index, batch.batch, h.size(0)) + "_node"
-                    
-                    if cache_key not in _dfs_cache_dict:
-                        node_order = self._dfs_node_order(batch.edge_index, batch.batch, h.size(0))
-                        node_order = self._sanitize_node_order(node_order, h.size(0), device=torch.device('cpu'))
-                        _dfs_cache_dict[cache_key] = node_order
-                    else:
-                        node_order = _dfs_cache_dict[cache_key]
-                    
-                    batch._cached_node_order = node_order.to(h.device, non_blocking=True)
 
         # Local MPNN.
         if self.local_model is not None:
@@ -461,6 +408,11 @@ class GPSLayer(nn.Module):
         return batch
 
     def _fuse_edge_node_outputs(self, h_node: torch.Tensor, h_edge: torch.Tensor) -> torch.Tensor:
+        # Be defensive: if NaN/Inf appears, gated fusion can propagate it into
+        # subsequent layers and lead to hard-to-debug CUDA asserts later.
+        h_node = torch.nan_to_num(h_node, nan=0.0, posinf=1e4, neginf=-1e4)
+        h_edge = torch.nan_to_num(h_edge, nan=0.0, posinf=1e4, neginf=-1e4)
+
         if h_node.shape != h_edge.shape:
             raise ValueError(f"Node/Edge scan output shape mismatch: {h_node.shape} vs {h_edge.shape}")
 
@@ -468,21 +420,54 @@ class GPSLayer(nn.Module):
         w = float(getattr(self, 'edge_node_weight', 0.5))
         w = 0.0 if w < 0.0 else (1.0 if w > 1.0 else w)
 
+        # For regression tasks (like peptides-structural), apply stronger numerical stabilization
+        # Check if this is likely a regression task by examining tensor magnitudes
+        h_node_max = h_node.abs().max()
+        h_edge_max = h_edge.abs().max()
+        is_regression_like = (h_node_max > 10.0) or (h_edge_max > 10.0)  # Heuristic threshold
+
+        if is_regression_like:
+            # Apply gradient clipping before fusion for regression tasks
+            clip_value = 5.0  # Conservative clipping
+            h_node = torch.clamp(h_node, -clip_value, clip_value)
+            h_edge = torch.clamp(h_edge, -clip_value, clip_value)
+
+        # Normalize both outputs to improve numerical stability when fusing
+        # This prevents one branch from dominating due to magnitude differences
+        h_node_norm = torch.norm(h_node, p=2, dim=-1, keepdim=True).clamp(min=1e-8)
+        h_edge_norm = torch.norm(h_edge, p=2, dim=-1, keepdim=True).clamp(min=1e-8)
+        h_node_normalized = h_node / h_node_norm
+        h_edge_normalized = h_edge / h_edge_norm
+        
+        # Use the average norm for reconstruction
+        avg_norm = (h_node_norm + h_edge_norm) / 2.0
+
         if mode == 'fixed':
-            return w * h_node + (1.0 - w) * h_edge
-        if mode == 'gated':
+            fused = w * h_node_normalized + (1.0 - w) * h_edge_normalized
+            result = fused * avg_norm
+        elif mode == 'gated':
             if self.edge_node_gate_layer is None:
                 raise RuntimeError("edge_node_gate_layer is not initialized (mode='gated').")
-            combined = torch.cat([h_node, h_edge], dim=-1)
+            combined = torch.cat([h_node_normalized, h_edge_normalized], dim=-1)
             gate = torch.sigmoid(self.edge_node_gate_layer(combined))
-            return gate * h_node + (1.0 - gate) * h_edge
-        if mode == 'concat':
+            fused = gate * h_node_normalized + (1.0 - gate) * h_edge_normalized
+            result = fused * avg_norm
+        elif mode == 'concat':
             if self.edge_node_concat_proj is None:
                 raise RuntimeError("edge_node_concat_proj is not initialized (mode='concat').")
-            combined = torch.cat([h_node, h_edge], dim=-1)
-            out = self.edge_node_concat_proj(combined)
-            return out
-        raise ValueError(f"Unsupported edge_node_fusion_mode: {mode}")
+            combined = torch.cat([h_node_normalized, h_edge_normalized], dim=-1)
+            fused = self.edge_node_concat_proj(combined)
+            # Restore magnitude after projection
+            fused_norm = torch.norm(fused, p=2, dim=-1, keepdim=True).clamp(min=1e-8)
+            result = fused / fused_norm * avg_norm
+        else:
+            raise ValueError(f"Unsupported edge_node_fusion_mode: {mode}")
+
+        # Final safety check for regression tasks
+        if is_regression_like:
+            result = torch.nan_to_num(result, nan=0.0, posinf=10.0, neginf=-10.0)
+
+        return result
 
     def _node_global_scan(self, batch, h: torch.Tensor) -> torch.Tensor:
         """Compute the global (sequence) model output over node embeddings.
@@ -505,16 +490,12 @@ class GPSLayer(nn.Module):
             if dfs_attr is not None and self._is_valid_permutation_1d(dfs_attr, h.size(0)):
                 h_ind_perm = dfs_attr
             else:
-                # Try to use cached node order first
-                cached_order = getattr(batch, '_cached_node_order', None)
-                if cached_order is not None and cached_order.numel() == h.size(0):
-                    h_ind_perm = cached_order
-                else:
-                    h_ind_perm = self._dfs_node_order(batch.edge_index, batch.batch, h.size(0))
-                    h_ind_perm = self._sanitize_node_order(h_ind_perm, h.size(0), device=torch.device('cpu'))
-                    h_ind_perm = h_ind_perm.to(h.device, non_blocking=True)
+                h_ind_perm = self._dfs_node_order(batch.edge_index, batch.batch, h.size(0))
+            h_ind_perm = self._sanitize_node_order(h_ind_perm, h.size(0), device=torch.device('cpu'))
+            h_ind_perm = h_ind_perm.to(h.device, non_blocking=True)
             h_dense, mask = to_dense_batch(h[h_ind_perm], batch.batch[h_ind_perm])
             flat_fwd = self.self_attn(h_dense)[mask]
+            flat_fwd = torch.nan_to_num(flat_fwd, nan=0.0, posinf=1e4, neginf=-1e4)
 
             num_nodes = h.size(0)
             if flat_fwd.size(0) != num_nodes:
@@ -530,16 +511,19 @@ class GPSLayer(nn.Module):
 
             h_fwd = flat_fwd.new_empty((num_nodes, flat_fwd.size(-1)))
             h_fwd[h_ind_perm] = flat_fwd
+            h_fwd = torch.nan_to_num(h_fwd, nan=0.0, posinf=1e4, neginf=-1e4)
             if not self.enable_reverse_mamba:
                 return h_fwd
 
             h_ind_perm_rev = torch.flip(h_ind_perm, dims=[0]).contiguous()
             h_dense_rev, mask_rev = to_dense_batch(h[h_ind_perm_rev], batch.batch[h_ind_perm_rev])
             flat_rev = self.self_attn_reverse(h_dense_rev)[mask_rev]
+            flat_rev = torch.nan_to_num(flat_rev, nan=0.0, posinf=1e4, neginf=-1e4)
             if flat_rev.size(0) != num_nodes:
                 return h_fwd
             h_rev = flat_rev.new_empty((num_nodes, flat_rev.size(-1)))
             h_rev[h_ind_perm_rev] = flat_rev
+            h_rev = torch.nan_to_num(h_rev, nan=0.0, posinf=1e4, neginf=-1e4)
             return self._fuse_mamba_outputs(h_fwd, h_rev)
 
         if self.global_model_type == 'Mamba_Hybrid_Degree_Noise':
@@ -549,21 +533,21 @@ class GPSLayer(nn.Module):
                 h_ind_perm = lexsort([deg + deg_noise, batch.batch])
                 h_dense, mask = to_dense_batch(h[h_ind_perm], batch.batch[h_ind_perm])
                 h_ind_perm_reverse = torch.argsort(h_ind_perm)
-                return self._apply_mamba_scan_with_permutation(
+                result = self._apply_mamba_scan_with_permutation(
                     h, batch.batch, h_ind_perm, h_dense, mask, h_ind_perm_reverse, batch
                 )
+                return torch.nan_to_num(result, nan=0.0, posinf=1e4, neginf=-1e4)
             mamba_arr = []
             for _ in range(5):
                 deg_noise = torch.rand_like(deg)
                 h_ind_perm = lexsort([deg + deg_noise, batch.batch])
                 h_dense, mask = to_dense_batch(h[h_ind_perm], batch.batch[h_ind_perm])
                 h_ind_perm_reverse = torch.argsort(h_ind_perm)
-                mamba_arr.append(
-                    self._apply_mamba_scan_with_permutation(
-                        h, batch.batch, h_ind_perm, h_dense, mask, h_ind_perm_reverse, batch
-                    )
+                result = self._apply_mamba_scan_with_permutation(
+                    h, batch.batch, h_ind_perm, h_dense, mask, h_ind_perm_reverse, batch
                 )
-            return sum(mamba_arr) / 5
+                mamba_arr.append(torch.nan_to_num(result, nan=0.0, posinf=1e4, neginf=-1e4))
+            return torch.stack(mamba_arr).mean(dim=0)
 
         if self.global_model_type == 'Mamba_Hybrid_Degree_Noise_Bucket':
             deg_ = degree(batch.edge_index[0], batch.x.shape[0]).to(torch.float)
@@ -578,6 +562,7 @@ class GPSLayer(nn.Module):
                     h_ind_perm_i = ind_i[h_ind_perm_sort]
                     h_dense, mask = to_dense_batch(h[h_ind_perm_i], batch.batch[h_ind_perm_i])
                     h_dense = self._apply_mamba_bucket_scan(h_dense, mask, batch)
+                    h_dense = torch.nan_to_num(h_dense, nan=0.0, posinf=1e4, neginf=-1e4)
                     indices_arr.append(h_ind_perm_i)
                     emb_arr.append(h_dense)
                 h_ind_perm_reverse = torch.argsort(torch.cat(indices_arr))
@@ -594,11 +579,12 @@ class GPSLayer(nn.Module):
                     h_ind_perm_i = ind_i[h_ind_perm_sort]
                     h_dense, mask = to_dense_batch(h[h_ind_perm_i], batch.batch[h_ind_perm_i])
                     h_dense = self._apply_mamba_bucket_scan(h_dense, mask, batch)
+                    h_dense = torch.nan_to_num(h_dense, nan=0.0, posinf=1e4, neginf=-1e4)
                     indices_arr.append(h_ind_perm_i)
                     emb_arr.append(h_dense)
                 h_ind_perm_reverse = torch.argsort(torch.cat(indices_arr))
                 mamba_arr.append(torch.cat(emb_arr)[h_ind_perm_reverse])
-            return sum(mamba_arr) / 5
+            return torch.stack(mamba_arr).mean(dim=0)
 
         if 'Mamba' in self.global_model_type:
             h_dense, mask = to_dense_batch(h, batch.batch)
@@ -650,6 +636,35 @@ class GPSLayer(nn.Module):
 
         edge_index = batch.edge_index
         num_nodes = h.size(0)
+
+        # Ensure basic invariants early to avoid device-side asserts from
+        # advanced indexing kernels.
+        if edge_index.dtype != torch.long:
+            edge_index = edge_index.to(torch.long)
+            batch.edge_index = edge_index
+
+        # Keep edge_index and edge_attr consistent if something upstream
+        # accidentally changed one but not the other.
+        if batch.edge_attr is None:
+            raise ValueError("edge scan requires batch.edge_attr.")
+        if batch.edge_attr.size(0) != edge_index.size(1):
+            min_len = min(int(batch.edge_attr.size(0)), int(edge_index.size(1)))
+            if not hasattr(self, '_warned_edge_attr_mismatch'):
+                setattr(self, '_warned_edge_attr_mismatch', True)
+                warnings.warn(
+                    f"edge_attr/edge_index length mismatch: edge_attr={batch.edge_attr.size(0)} vs "
+                    f"num_edges={edge_index.size(1)}. Truncating to {min_len}.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            batch.edge_attr = batch.edge_attr[:min_len]
+            edge_index = edge_index[:, :min_len]
+            batch.edge_index = edge_index
+            if hasattr(batch, 'dfs_edge_order'):
+                delattr(batch, 'dfs_edge_order')
+            if hasattr(batch, 'dfs_edge_rank'):
+                delattr(batch, 'dfs_edge_rank')
+
         valid_edge_mask = (
             (edge_index[0] >= 0)
             & (edge_index[0] < num_nodes)
@@ -677,45 +692,67 @@ class GPSLayer(nn.Module):
         edge_feat = torch.nan_to_num(edge_feat, nan=0.0, posinf=1e4, neginf=-1e4)
 
         num_edges = int(edge_index.size(1))
-        edge_batch_all = batch.batch[edge_index[0]]
+        # After filtering, edge_index must be in range; if not, fall back to
+        # filtering again (prevents torch_scatter / indexing device asserts).
+        if num_edges > 0:
+            src0 = edge_index[0]
+            dst0 = edge_index[1]
+            in_range = (src0 >= 0) & (src0 < num_nodes) & (dst0 >= 0) & (dst0 < num_nodes)
+            if not bool(in_range.all()):
+                edge_index = edge_index[:, in_range]
+                batch.edge_index = edge_index
+                batch.edge_attr = batch.edge_attr[in_range]
+                num_edges = int(edge_index.size(1))
+                if hasattr(batch, 'dfs_edge_order'):
+                    delattr(batch, 'dfs_edge_order')
+                if hasattr(batch, 'dfs_edge_rank'):
+                    delattr(batch, 'dfs_edge_rank')
 
-        dfs_edge_rank = getattr(batch, 'dfs_edge_rank', None)
-        if torch.is_tensor(dfs_edge_rank) and dfs_edge_rank.numel() == num_edges:
-            rank = dfs_edge_rank.to(device=edge_batch_all.device, non_blocking=True).view(-1)
-            if rank.dtype != torch.long:
-                rank = rank.to(torch.long)
-            batch_id = edge_batch_all.to(torch.long)
-            stride = (rank.max() + 1).to(torch.long)
-            key = batch_id * stride + rank
-            edge_order = torch.argsort(key)
-        else:
-            # Try to use cached edge order (computed once in forward() to avoid redundant DFS)
-            dfs_edge_order = getattr(batch, 'dfs_edge_order', None)
-            if dfs_edge_order is not None and self._is_valid_permutation_1d(dfs_edge_order, num_edges):
-                edge_order = dfs_edge_order
+        edge_batch_all = batch.batch[edge_index[0]] if num_edges > 0 else batch.batch.new_empty((0,), dtype=torch.long)
+
+        if self.edge_scan_order == 'default':
+            edge_order = torch.arange(num_edges, device=edge_index.device)
+        else:  # 'dfs'
+            dfs_edge_rank = getattr(batch, 'dfs_edge_rank', None)
+            if torch.is_tensor(dfs_edge_rank) and dfs_edge_rank.numel() == num_edges:
+                rank = dfs_edge_rank.to(device=edge_batch_all.device, non_blocking=True).view(-1)
+                if rank.dtype != torch.long:
+                    rank = rank.to(torch.long)
+                batch_id = edge_batch_all.to(torch.long)
+                stride = (rank.max() + 1).to(torch.long)
+                key = batch_id * stride + rank
+                edge_order = torch.argsort(key)
             else:
-                # Check for cached edge order first
-                cached_order = getattr(batch, '_cached_edge_order', None)
-                if cached_order is not None and cached_order.numel() == num_edges:
-                    edge_order = cached_order
+                dfs_edge_order = getattr(batch, 'dfs_edge_order', None)
+                if dfs_edge_order is not None and self._is_valid_permutation_1d(dfs_edge_order, num_edges):
+                    edge_order = dfs_edge_order
                 else:
                     edge_order = self._dfs_edge_order(edge_index, batch.batch, num_nodes)
-                    edge_order = self._sanitize_edge_order(edge_order, num_edges, device=torch.device('cpu'))
-                    edge_order = edge_order.to(edge_index.device, non_blocking=True)
+                # Keep sanitation on-device for performance; fall back internally if invalid.
+                edge_order = self._sanitize_edge_order(edge_order, num_edges, device=edge_index.device)
+
+        # Final safety: ensure edge_order is within bounds.
+        if num_edges > 0:
+            if edge_order.dtype != torch.long:
+                edge_order = edge_order.to(torch.long)
+            if edge_order.numel() != num_edges or int(edge_order.min()) < 0 or int(edge_order.max()) >= num_edges:
+                edge_order = self._sanitize_edge_order(edge_order, num_edges, device=edge_index.device)
 
         edge_feat_perm = edge_feat[edge_order]
         edge_batch = edge_batch_all[edge_order]
         edge_dense, edge_mask = to_dense_batch(edge_feat_perm, edge_batch)
         edge_out = self.self_attn(edge_dense)[edge_mask]
+        edge_out = torch.nan_to_num(edge_out, nan=0.0, posinf=1e4, neginf=-1e4)
         edge_out = edge_out[torch.argsort(edge_order)]
         batch.edge_attr = edge_out
 
         src, dst = edge_index[0], edge_index[1]
         node_msg = scatter_mean_fallback(edge_out, src, dim_size=num_nodes)
-        # Accumulate messages from destination nodes as well
-        dst_msg = scatter_mean_fallback(edge_out, dst, dim_size=num_nodes)
-        node_msg = node_msg + dst_msg
-        return torch.nan_to_num(node_msg, nan=0.0, posinf=1e4, neginf=-1e4)
+        node_msg = node_msg + scatter_mean_fallback(edge_out, dst, dim_size=num_nodes)
+        # Scale down to prevent gradient explosion when combining multiple sources
+        node_msg = node_msg / 2.0
+        node_msg = torch.nan_to_num(node_msg, nan=0.0, posinf=1e4, neginf=-1e4)
+        return node_msg
 
     def _sanitize_edge_order(self, edge_order, num_edges: int, device: torch.device) -> torch.Tensor:
         if num_edges == 0:
@@ -738,17 +775,30 @@ class GPSLayer(nn.Module):
                 RuntimeWarning,
                 stacklevel=2,
             )
-        edge_list = edge_order.detach().cpu().tolist()
-        used = [False] * num_edges
-        out = []
-        for v in edge_list:
-            iv = int(v)
-            if 0 <= iv < num_edges and not used[iv]:
-                used[iv] = True
-                out.append(iv)
-        if len(out) < num_edges:
-            out.extend([i for i, u in enumerate(used) if not u])
-        return torch.tensor(out, device=device, dtype=torch.long)
+        # Slow-path: build a valid permutation.
+        # Prefer tensor ops; avoid Python per-element loops.
+        edge_order = edge_order.to(device=device, dtype=torch.long, non_blocking=True).view(-1)
+        edge_order = edge_order[(edge_order >= 0) & (edge_order < num_edges)]
+        if edge_order.numel() == 0:
+            return torch.arange(num_edges, device=device, dtype=torch.long)
+        # Remove duplicates while preserving first occurrence.
+        # Use CPU only when absolutely necessary.
+        try:
+            uniq, inv = torch.unique(edge_order, return_inverse=True)
+            # `torch.unique` does not preserve order; emulate stable unique via
+            # first occurrence positions.
+            first_pos = torch.full((uniq.numel(),), edge_order.numel(), device=device, dtype=torch.long)
+            pos = torch.arange(edge_order.numel(), device=device, dtype=torch.long)
+            first_pos.scatter_reduce_(0, inv, pos, reduce='amin', include_self=True)
+            keep = torch.argsort(first_pos)
+            stable_uniq = uniq[keep]
+        except Exception:
+            stable_uniq = edge_order.detach().cpu().unique(sorted=False).to(device=device)
+
+        seen = torch.zeros(num_edges, device=device, dtype=torch.bool)
+        seen[stable_uniq] = True
+        missing = (~seen).nonzero().view(-1)
+        return torch.cat([stable_uniq, missing], dim=0)[:num_edges]
 
     def _sanitize_node_order(self, node_order, num_nodes: int, device: torch.device) -> torch.Tensor:
         if num_nodes == 0:
@@ -771,148 +821,94 @@ class GPSLayer(nn.Module):
                 RuntimeWarning,
                 stacklevel=2,
             )
-        node_list = node_order.detach().cpu().tolist()
-        used = [False] * num_nodes
-        out = []
-        for v in node_list:
-            iv = int(v)
-            if 0 <= iv < num_nodes and not used[iv]:
-                used[iv] = True
-                out.append(iv)
-        if len(out) < num_nodes:
-            out.extend([i for i, u in enumerate(used) if not u])
-        return torch.tensor(out, device=device, dtype=torch.long)
+        node_order = node_order.to(device=device, dtype=torch.long, non_blocking=True).view(-1)
+        node_order = node_order[(node_order >= 0) & (node_order < num_nodes)]
+        if node_order.numel() == 0:
+            return torch.arange(num_nodes, device=device, dtype=torch.long)
+        try:
+            uniq, inv = torch.unique(node_order, return_inverse=True)
+            first_pos = torch.full((uniq.numel(),), node_order.numel(), device=device, dtype=torch.long)
+            pos = torch.arange(node_order.numel(), device=device, dtype=torch.long)
+            first_pos.scatter_reduce_(0, inv, pos, reduce='amin', include_self=True)
+            keep = torch.argsort(first_pos)
+            stable_uniq = uniq[keep]
+        except Exception:
+            stable_uniq = node_order.detach().cpu().unique(sorted=False).to(device=device)
+
+        seen = torch.zeros(num_nodes, device=device, dtype=torch.bool)
+        seen[stable_uniq] = True
+        missing = (~seen).nonzero().view(-1)
+        return torch.cat([stable_uniq, missing], dim=0)[:num_nodes]
 
     def _dfs_node_order(self, edge_index: torch.Tensor, node_batch: torch.Tensor, num_nodes: int) -> torch.Tensor:
-        """Compute DFS node order with optimized torch operations to minimize GPU-CPU transfers."""
         edge_index_cpu = edge_index.detach().cpu()
         node_batch_cpu = node_batch.detach().cpu()
-        src = edge_index_cpu[0]
-        dst = edge_index_cpu[1]
-
-        # Build adjacency list more efficiently using torch operations
-        # Use offsets instead of tolist() for faster access
+        src = edge_index_cpu[0].tolist()
+        dst = edge_index_cpu[1].tolist()
         adjacency = [[] for _ in range(num_nodes)]
-        src_list = src.tolist()  # Only converting once here
-        dst_list = dst.tolist()  # Only converting once here
-        
-        for u, v in zip(src_list, dst_list):
+        for u, v in zip(src, dst):
             if 0 <= u < num_nodes and 0 <= v < num_nodes:
                 adjacency[u].append(v)
 
         order = []
-        visited = set()
-        # Use torch operations to get unique graphs instead of converting to list multiple times
-        unique_graphs_tensor = torch.unique(node_batch_cpu)
-
-        for gid_tensor in unique_graphs_tensor:
-            gid = int(gid_tensor.item())  # Convert once
-            nodes_tensor = torch.where(node_batch_cpu == gid)[0]
-            nodes = nodes_tensor.tolist()  # Only convert once per graph
+        unique_graphs = torch.unique(node_batch_cpu).tolist()
+        for gid in unique_graphs:
+            nodes = torch.where(node_batch_cpu == gid)[0].tolist()
+            visited = set()
             node_set = set(nodes)
-            
             for start in nodes:
                 if start in visited:
                     continue
-                # Iterative DFS to avoid stack overflow and improve performance
                 stack = [start]
-                traverse_order = []
-                
                 while stack:
-                    cur = stack[-1]
+                    cur = stack.pop()
                     if cur in visited:
-                        stack.pop()
                         continue
                     visited.add(cur)
-                    traverse_order.append(cur)
-                    
-                    # Add neighbors in reverse order for consistent traversal
-                    neighbors = [nxt for nxt in adjacency[cur] 
-                                if nxt in node_set and nxt not in visited]
-                    if neighbors:
-                        stack.extend(reversed(neighbors))
-                    else:
-                        stack.pop()
-                
-                order.extend(traverse_order)
-            
-            # Add unvisited nodes in this graph
+                    order.append(cur)
+                    for nxt in reversed(adjacency[cur]):
+                        if nxt in node_set and nxt not in visited:
+                            stack.append(nxt)
             for n in nodes:
                 if n not in visited:
                     order.append(n)
-                    visited.add(n)
-                    
         return torch.tensor(order, device=edge_index.device, dtype=torch.long)
 
     def _dfs_edge_order(self, edge_index: torch.Tensor, node_batch: torch.Tensor, num_nodes: int) -> torch.Tensor:
-        """Compute DFS edge order with optimized torch operations.
-        
-        Key optimization: Minimize GPU-CPU transfers by converting to list only once per component,
-        instead of repeatedly throughout the DFS traversal.
-        """
-        edge_index_cpu = edge_index.detach().cpu()
-        # Convert to lists ONCE to avoid repeated GPU-CPU transfers
-        src_list = edge_index_cpu[0].tolist()
-        dst_list = edge_index_cpu[1].tolist()
+        src = edge_index[0].tolist()
+        dst = edge_index[1].tolist()
         edge_ids = list(range(edge_index.size(1)))
-        
-        # Build adjacency list with edge indices for efficient traversal
         adjacency = [[] for _ in range(num_nodes)]
-        for eid, (u, v) in enumerate(zip(src_list, dst_list)):
+        for eid, (u, v) in enumerate(zip(src, dst)):
             adjacency[u].append((v, eid))
 
         order = []
-        visited_edges = set()
-        node_batch_cpu = node_batch.detach().cpu()
-        
-        # Get unique graphs once using torch, then convert to list once
-        unique_graphs_tensor = torch.unique(node_batch_cpu)
-        unique_graphs = unique_graphs_tensor.tolist()
-        
+        unique_graphs = torch.unique(node_batch).tolist()
         for gid in unique_graphs:
-            # Get nodes for this graph - convert once
-            nodes_tensor = torch.where(node_batch_cpu == gid)[0]
-            nodes = nodes_tensor.tolist()
-            
+            nodes = torch.where(node_batch == gid)[0].tolist()
             if not nodes:
                 continue
             visited_nodes = set()
-            
+            used_edges = set()
             for start in nodes:
                 if start in visited_nodes:
                     continue
-                # Iterative DFS for node traversal, collecting edges
                 stack = [start]
-                
                 while stack:
-                    cur = stack[-1]
+                    cur = stack.pop()
                     if cur in visited_nodes:
-                        stack.pop()
                         continue
                     visited_nodes.add(cur)
-                    
-                    # Process all edges from current node
-                    unvisited_neighbors = []
-                    for nxt, eid in adjacency[cur]:
-                        if eid not in visited_edges:
+                    for nxt, eid in reversed(adjacency[cur]):
+                        if eid not in used_edges:
                             order.append(eid)
-                            visited_edges.add(eid)
-                        # Check if next node is unvisited and in the same graph
-                        # Use cached node_batch_cpu to avoid .item() calls in loops
-                        if nxt not in visited_nodes and node_batch_cpu[nxt].item() == gid:
-                            unvisited_neighbors.append(nxt)
-                    
-                    if unvisited_neighbors:
-                        stack.extend(reversed(unvisited_neighbors))
-                    else:
-                        stack.pop()
+                            used_edges.add(eid)
+                        if nxt not in visited_nodes and node_batch[nxt].item() == gid:
+                            stack.append(nxt)
 
-        # Add remaining edges that weren't visited
-        if len(visited_edges) < len(edge_ids):
-            for eid in edge_ids:
-                if eid not in visited_edges:
-                    order.append(eid)
-                    
+        if len(order) < len(edge_ids):
+            used = set(order)
+            order.extend([eid for eid in edge_ids if eid not in used])
         return torch.tensor(order, device=edge_index.device, dtype=torch.long)
 
     def extra_repr(self):
@@ -924,6 +920,7 @@ class GPSLayer(nn.Module):
     def _apply_mamba_bucket_scan(self, h_dense: torch.Tensor, mask: torch.Tensor, batch) -> torch.Tensor:
         """Apply (optionally bidirectional) Mamba on a dense sequence and return flat masked output."""
         h_fwd = self.self_attn(h_dense)
+        h_fwd = torch.nan_to_num(h_fwd, nan=0.0, posinf=1e4, neginf=-1e4)
         if not self.enable_reverse_mamba:
             return h_fwd[mask]
         reverse_mamba = getattr(self, 'self_attn_reverse', None)
@@ -932,7 +929,9 @@ class GPSLayer(nn.Module):
         h_rev = torch.flip(h_dense, dims=[1])
         h_rev = reverse_mamba(h_rev)
         h_rev = torch.flip(h_rev, dims=[1])
+        h_rev = torch.nan_to_num(h_rev, nan=0.0, posinf=1e4, neginf=-1e4)
         h_attn = self._fuse_mamba_outputs(h_fwd, h_rev)
+        h_attn = torch.nan_to_num(h_attn, nan=0.0, posinf=1e4, neginf=-1e4)
         return h_attn[mask]
 
     def _apply_mamba_scan_with_permutation(
@@ -947,13 +946,70 @@ class GPSLayer(nn.Module):
     ) -> torch.Tensor:
         """Run Mamba on a permuted dense sequence (and optionally reverse) and map back."""
         h_fwd = self.self_attn(h_dense)[mask][h_ind_perm_reverse]
+        h_fwd = torch.nan_to_num(h_fwd, nan=0.0, posinf=1e4, neginf=-1e4)
         if not self.enable_reverse_mamba:
             return h_fwd
-        h_ind_perm_rev = torch.flip(h_ind_perm, dims=[0])
+
+        # IMPORTANT:
+        # A naive `torch.flip(h_ind_perm)` makes `batch_index[h_ind_perm_rev]`
+        # typically *decreasing* (graphs appear in reverse order). Some PyG
+        # versions/utilities assume the `batch` vector is sorted/non-decreasing
+        # and can produce an incorrect mask whose number of True entries is
+        # smaller than `num_nodes`. That mismatch then triggers CUDA
+        # IndexKernel out-of-bounds when we later index with an inverse
+        # permutation of length `num_nodes`.
+        #
+        # Fix: reverse the node order *within each graph* while keeping graphs
+        # in increasing batch id order.
+        h_ind_perm_rev = self._reverse_perm_within_batch(h_ind_perm, batch_index)
+
         h_dense_rev, mask_rev = to_dense_batch(h[h_ind_perm_rev], batch_index[h_ind_perm_rev])
         h_ind_perm_rev_reverse = torch.argsort(h_ind_perm_rev)
         reverse_mamba = getattr(self, 'self_attn_reverse', None)
         if reverse_mamba is None:
             raise ValueError("enable_reverse_mamba=True requires self_attn_reverse")
         h_rev = reverse_mamba(h_dense_rev)[mask_rev][h_ind_perm_rev_reverse]
-        return self._fuse_mamba_outputs(h_fwd, h_rev)
+        h_rev = torch.nan_to_num(h_rev, nan=0.0, posinf=1e4, neginf=-1e4)
+        result = self._fuse_mamba_outputs(h_fwd, h_rev)
+        return torch.nan_to_num(result, nan=0.0, posinf=1e4, neginf=-1e4)
+
+    @staticmethod
+    def _reverse_perm_within_batch(h_ind_perm: torch.Tensor, batch_index: torch.Tensor) -> torch.Tensor:
+        """Reverse a node permutation within each graph, preserving graph order.
+
+        Args:
+            h_ind_perm: A 1D index tensor (ideally a permutation of [0..N-1]).
+            batch_index: The `batch.batch` vector mapping each node -> graph id.
+
+        Returns:
+            A new permutation where nodes are reversed within each graph.
+        """
+        if h_ind_perm.numel() == 0:
+            return h_ind_perm
+        if h_ind_perm.dtype != torch.long:
+            h_ind_perm = h_ind_perm.to(torch.long)
+
+        # Fully vectorized GPU implementation.
+        device = h_ind_perm.device
+        batch_perm = batch_index[h_ind_perm].to(torch.long)
+
+        # Ensure (mostly) non-decreasing batch ids; if not, stably sort by batch.
+        if batch_perm.numel() > 1 and not bool((batch_perm[1:] >= batch_perm[:-1]).all()):
+            order = torch.argsort(batch_perm, stable=True)
+            h_ind_perm = h_ind_perm[order]
+            batch_perm = batch_perm[order]
+
+        n = int(h_ind_perm.numel())
+        if n == 0:
+            return h_ind_perm
+
+        num_graphs = int(batch_perm.max().item()) + 1
+        counts = torch.bincount(batch_perm, minlength=num_graphs)
+        offsets = torch.cumsum(counts, dim=0)
+        starts = offsets - counts
+
+        pos = torch.arange(n, device=device, dtype=torch.long)
+        start_pos = starts[batch_perm]
+        end_pos = offsets[batch_perm]
+        pos_rev = start_pos + (end_pos - 1 - pos)
+        return h_ind_perm[pos_rev]
