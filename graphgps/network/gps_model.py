@@ -6,6 +6,7 @@ from torch_geometric.graphgym.models.layer import (new_layer_config,
                                                    BatchNorm1dNode)
 from torch_geometric.graphgym.register import register_network
 from graphgps.encoder.ER_edge_encoder import EREdgeEncoder
+import logging
 
 from graphgps.layer.gps_layer import GPSLayer
 
@@ -98,6 +99,7 @@ class GPSModel(torch.nn.Module):
                 fixed_weight=cfg.gt.fixed_weight,
                 scan_target=getattr(cfg.gt, 'scan_target', 'node'),
                 edge_dim=getattr(cfg.gnn, 'dim_edge', cfg.gt.dim_hidden),
+                edge_scan_order=getattr(cfg.gt, 'edge_scan_order', 'dfs'),
             ))
         self.layers = torch.nn.Sequential(*layers)
 
@@ -105,6 +107,26 @@ class GPSModel(torch.nn.Module):
         self.post_mp = GNNHead(dim_in=cfg.gnn.dim_inner, dim_out=dim_out)
 
     def forward(self, batch):
-        for module in self.children():
+        for i, module in enumerate(self.children()):
             batch = module(batch)
+
+            # 防守检查：在每个模块后检查 NaN/Inf
+            if hasattr(batch, 'x') and batch.x is not None:
+                if not torch.isfinite(batch.x).all():
+                    num_bad = (~torch.isfinite(batch.x)).sum().item()
+                    logging.warning(
+                        f"Non-finite values detected after module {i} ({module.__class__.__name__}): "
+                        f"{num_bad}/{batch.x.numel()} elements. Applying recovery..."
+                    )
+                    batch.x = torch.nan_to_num(batch.x, nan=0.0, posinf=1e4, neginf=-1e4)
+
+            if hasattr(batch, 'edge_attr') and batch.edge_attr is not None:
+                if not torch.isfinite(batch.edge_attr).all():
+                    num_bad = (~torch.isfinite(batch.edge_attr)).sum().item()
+                    logging.warning(
+                        f"Non-finite edge_attr after module {i}: {num_bad}/{batch.edge_attr.numel()} elements. "
+                        f"Applying recovery..."
+                    )
+                    batch.edge_attr = torch.nan_to_num(batch.edge_attr, nan=0.0, posinf=1e4, neginf=-1e4)
+
         return batch
