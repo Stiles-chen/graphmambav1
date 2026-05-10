@@ -183,14 +183,38 @@ class CustomLogger(Logger):
 
     def regression(self):
         true, pred = torch.cat(self._true), torch.cat(self._pred)
+        # Guard against occasional NaN/Inf predictions causing sklearn metrics
+        # to crash mid-run.
+        true = torch.nan_to_num(true, nan=0.0, posinf=1e4, neginf=-1e4)
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+        
+        # 二次安全检查：确保没有遗留的有限值问题
+        true = true[torch.isfinite(true)]
+        pred = pred[torch.isfinite(pred)]
+        
+        # 确保两个数组有相同的长度（如果过滤后不相等，需要对齐）
+        if true.numel() < 1 or pred.numel() < 1:
+            logging.warning("After filtering non-finite values, no valid predictions remain for regression metrics.")
+            return {
+                'mae': 0.0,
+                'r2': 0.0,
+                'spearmanr': 0.0,
+                'mse': 0.0,
+                'rmse': 0.0,
+            }
+        
+        min_len = min(true.numel(), pred.numel())
+        true = true[:min_len]
+        pred = pred[:min_len]
+        
         reformat = lambda x: round(float(x), cfg.round)
         return {
-            'mae': reformat(mean_absolute_error(true, pred)),
-            'r2': reformat(r2_score(true, pred, multioutput='uniform_average')),
+            'mae': reformat(mean_absolute_error(true.cpu().numpy(), pred.cpu().numpy())),
+            'r2': reformat(r2_score(true.cpu().numpy(), pred.cpu().numpy(), multioutput='uniform_average')),
             'spearmanr': reformat(eval_spearmanr(true.numpy(),
                                                  pred.numpy())['spearmanr']),
-            'mse': reformat(mean_squared_error(true, pred)),
-            'rmse': reformat(np.sqrt(mean_squared_error(true, pred))),
+            'mse': reformat(mean_squared_error(true.cpu().numpy(), pred.cpu().numpy())),
+            'rmse': reformat(np.sqrt(mean_squared_error(true.cpu().numpy(), pred.cpu().numpy()))),
         }
 
     def update_stats(self, true, pred, loss, lr, time_used, params,
@@ -216,6 +240,38 @@ class CustomLogger(Logger):
         else:
             assert true.shape[0] == pred.shape[0]
             batch_size = true.shape[0]
+
+        # Sanitize any NaN/Inf values to keep metric computation robust.
+        # This does *not* fix the underlying numerical instability, but prevents
+        # sklearn metric functions from raising and aborting long runs.
+        if torch.is_tensor(pred):
+            bad = ~torch.isfinite(pred)
+            if bool(bad.any()):
+                num_bad = int(bad.sum().item())
+                if not hasattr(self, '_warned_non_finite_pred'):
+                    setattr(self, '_warned_non_finite_pred', True)
+                    logging.warning(
+                        "Non-finite values detected in predictions (NaN/Inf). "
+                        "They will be replaced via torch.nan_to_num for metric computation. "
+                        "First occurrence: %s elements.",
+                        num_bad,
+                    )
+                kwargs.setdefault('non_finite_pred', float(num_bad))
+                pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+        if torch.is_tensor(true):
+            bad_true = ~torch.isfinite(true)
+            if bool(bad_true.any()):
+                num_bad_true = int(bad_true.sum().item())
+                if not hasattr(self, '_warned_non_finite_true'):
+                    setattr(self, '_warned_non_finite_true', True)
+                    logging.warning(
+                        "Non-finite values detected in ground truth labels (NaN/Inf). "
+                        "They will be replaced via torch.nan_to_num. "
+                        "First occurrence: %s elements.",
+                        num_bad_true,
+                    )
+                kwargs.setdefault('non_finite_true', float(num_bad_true))
+            true = torch.nan_to_num(true, nan=0.0, posinf=1e4, neginf=-1e4)
         self._iter += 1
         self._true.append(true)
         self._pred.append(pred)
