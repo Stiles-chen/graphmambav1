@@ -67,6 +67,15 @@ def set_cfg_gt(cfg):
 
     cfg.gt.scan_target = 'node'
 
+    #default or dfs
+    cfg.gt.edge_scan_order = 'default'
+
+    # When `scan_target: both`, fuse node-scan and edge-scan outputs.
+    # If not set in a yaml, GPSLayer will fall back to `fusion_mode/fixed_weight`.
+    cfg.gt.edge_node_fusion_mode = 'fixed'
+
+    cfg.gt.edge_node_weight = 0.5
+
     # BigBird model/GPS-BigBird layer.
     cfg.gt.bigbird = CN()
 
