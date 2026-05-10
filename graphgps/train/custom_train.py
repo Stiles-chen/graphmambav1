@@ -142,6 +142,8 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
     model.train()
     optimizer.zero_grad()
     time_start = time.time()
+    skipped_non_finite_loss = 0
+    skipped_non_finite_grad = 0
     for iter, batch in enumerate(loader):
         if if_select:
             ratio = 1.0
@@ -179,9 +181,32 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
             if if_select:
                 total_node += batch.x.size(0)
 
+        if not torch.isfinite(loss):
+            skipped_non_finite_loss += 1
+            logging.warning(
+                "Non-finite loss detected at iter %d (split=train). Skipping backward/update for this batch.",
+                iter,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
         loss.backward()
         # Parameters update after accumulating gradients for given num. batches.
         if ((iter + 1) % batch_accumulation == 0) or (iter + 1 == len(loader)):
+            found_non_finite_grad = False
+            for p in model.parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    found_non_finite_grad = True
+                    break
+            if found_non_finite_grad:
+                skipped_non_finite_grad += 1
+                logging.warning(
+                    "Non-finite gradients detected at iter %d (split=train). "
+                    "Clearing gradients and skipping optimizer step.",
+                    iter,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                continue
             if cfg.optim.clip_grad_norm:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -194,6 +219,13 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
                             params=cfg.params,
                             dataset_name=cfg.dataset.name)
         time_start = time.time()
+    if skipped_non_finite_loss > 0 or skipped_non_finite_grad > 0:
+        logging.warning(
+            "train_epoch summary: skipped %d batches due to non-finite loss, "
+            "skipped %d optimizer steps due to non-finite gradients.",
+            skipped_non_finite_loss,
+            skipped_non_finite_grad,
+        )
     if if_flop:
         print('################ Print flop')
         print(total_flop_s / sample_count, params)
