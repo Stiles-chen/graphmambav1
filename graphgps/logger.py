@@ -49,8 +49,16 @@ class CustomLogger(Logger):
 
     # basic properties
     def basic(self):
+        size_current = self._size_current
+        if size_current == 0:
+            logging.warning(
+                "Logger has zero samples for current epoch; returning fallback basic stats."
+            )
+            loss_value = float('nan')
+        else:
+            loss_value = self._loss / size_current
         stats = {
-            'loss': round(self._loss / self._size_current, max(8, cfg.round)),
+            'loss': round(loss_value, max(8, cfg.round)) if np.isfinite(loss_value) else float('nan'),
             'lr': round(self._lr, max(8, cfg.round)),
             'params': self._params,
             'time_iter': round(self.time_iter(), cfg.round),

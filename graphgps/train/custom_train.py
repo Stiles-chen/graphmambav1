@@ -15,6 +15,25 @@ from torch_geometric.graphgym.utils.epoch import is_eval_epoch, is_ckpt_epoch
 from graphgps.loss.subtoken_prediction_loss import subtoken_cross_entropy
 from graphgps.utils import cfg_to_dict, flatten_dict, make_wandb_name
 
+
+def _finite_stats(name, tensor):
+    if tensor is None:
+        return f"{name}=None"
+    if not torch.is_tensor(tensor):
+        return f"{name}=not_tensor"
+    t = tensor.detach()
+    finite = torch.isfinite(t)
+    total = t.numel()
+    bad = int((~finite).sum().item())
+    if total == 0:
+        return f"{name}: empty"
+    if bad == total:
+        return f"{name}: bad={bad}/{total} (all non-finite)"
+    ft = t[finite]
+    return (f"{name}: bad={bad}/{total} min={ft.min().item():.4e} "
+            f"max={ft.max().item():.4e} mean={ft.mean().item():.4e} "
+            f"std={ft.std(unbiased=False).item():.4e}")
+
 # from deepspeed.profiling.flops_profiler import FlopsProfiler
 # from torch.autograd import profiler
 #from torch.profiler import profile, record_function, ProfilerActivity
@@ -154,8 +173,14 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
             prof.start_profile()
         batch.split = 'train'
         batch.to(torch.device(cfg.device))
+        if debug_edge_voc and iter < debug_max_iter:
+            logging.info(_finite_stats("train.batch.x", getattr(batch, 'x', None)))
+            logging.info(_finite_stats("train.batch.edge_attr", getattr(batch, 'edge_attr', None)))
 
         pred, true = model(batch)
+        if debug_edge_voc and iter < debug_max_iter:
+            logging.info(_finite_stats("train.pred", pred))
+            logging.info(_finite_stats("train.true", true))
         if cfg.dataset.name == 'ogbg-code2':
             loss, pred_score = subtoken_cross_entropy(pred, true)
             _true = true
@@ -191,6 +216,15 @@ def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation)
             continue
 
         loss.backward()
+        if debug_edge_voc and iter < debug_max_iter:
+            bad_names = []
+            for n, p in model.named_parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    bad_names.append(n)
+                    if len(bad_names) >= 5:
+                        break
+            if bad_names:
+                logging.warning("First non-finite grad params (iter=%d): %s", iter, bad_names)
         # Parameters update after accumulating gradients for given num. batches.
         if ((iter + 1) % batch_accumulation == 0) or (iter + 1 == len(loader)):
             found_non_finite_grad = False
