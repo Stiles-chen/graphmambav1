@@ -145,6 +145,20 @@ def _forward_eval_batch(loader, model, batch, split):
 #     return pred, true
 
 def train_epoch(logger, loader, model, optimizer, scheduler, batch_accumulation):
+    # Always define debug flags up-front to avoid NameError under partial merges.
+    debug_edge_voc = False
+    debug_max_iter = 0
+    try:
+        debug_edge_voc = (
+            getattr(cfg.dataset, 'name', None) == 'edge_wt_region_boundary' and
+            getattr(cfg.gt, 'scan_target', 'node') == 'edge'
+        )
+        debug_max_iter = int(getattr(cfg.train, 'debug_max_iter', 50))
+    except Exception:
+        # Keep training functional even if cfg is partially initialized.
+        debug_edge_voc = False
+        debug_max_iter = 0
+
     # flop related
     if_mem = False
     if_flop = False
